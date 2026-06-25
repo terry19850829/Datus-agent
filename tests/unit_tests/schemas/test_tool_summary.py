@@ -902,8 +902,20 @@ def test_failure_path_uniform(tool: str):
         ("list_document_nav", {"total_docs": 5}, "5 docs"),
         ("get_document", {"chunks": [1, 2, 3]}, "3 chunks"),
         ("search_document", {"docs": [1]}, "1 doc match"),
-        ("web_search_document", [1, 2, 3], "3 web results"),
-        ("web_search_document", {"docs": [1, 2]}, "2 web results"),
+        # Canonical web_search schema (query/results keys) → labelled summary.
+        (
+            "web_search",
+            {"query": "q", "result_count": 1, "results": [{"title": "T", "url": "https://u", "snippet": "s"}]},
+            "1 web result: T",
+        ),
+        # web_search / web_fetch legacy fallbacks (bare list / docs shape, no
+        # canonical query/results keys).
+        ("web_search", [1, 2, 3], "3 web results"),
+        ("web_search", {"docs": [1, 2]}, "2 web results"),
+        # Canonical web_fetch schema → "<label> (N chars)" (web tools bypass the
+        # 19-char clip, like filesystem tools).
+        ("web_fetch", {"content": "abcde"}, "fetched (5 chars)"),
+        ("web_fetch", {"content": "abcde", "truncated": True}, "fetched (5 chars) (truncated)"),
     ],
 )
 def test_per_tool_fallback_branches(tool: str, payload: Any, expected: str):
@@ -1007,7 +1019,8 @@ _LENGTH_CONTRACT_SAMPLES: list[tuple[str, Any]] = [
     ("list_document_nav", {"platform": "snowflake", "total_docs": 99999}),
     ("get_document", {"platform": "snowflake", "chunk_count": 99999}),
     ("search_document", {"docs": [{}] * 999}),
-    ("web_search_document", [{}] * 999),
+    # web_search / web_fetch are intentionally exempt (in FS_TOOLS_NO_CLIP) so
+    # their result titles / page label stay visible — not part of this contract.
 ]
 
 
