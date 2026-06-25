@@ -46,6 +46,29 @@ class TestDBFuncToolCompressorModelName:
 
         assert tool.compressor.model_name == "gpt-3.5-turbo"
 
+    def test_table_semantic_profile_store_disabled_when_size_probe_fails(self):
+        mock_connector = Mock()
+        mock_connector.dialect = "sqlite"
+        mock_connector.get_databases.return_value = []
+
+        mock_config = Mock()
+        mock_config.active_model.return_value.model = "gpt-4o"
+        mock_config.project_name = "project"
+
+        with (
+            patch("datus.tools.func_tool.database.SchemaWithValueRAG") as mock_rag,
+            patch("datus.tools.func_tool.database.SemanticModelRAG") as mock_sem,
+            patch("datus.tools.func_tool.database.TableSemanticProfileRAG") as mock_profile,
+        ):
+            mock_rag.return_value.schema_store.table_size.return_value = 0
+            mock_sem.return_value.get_size.return_value = 0
+            mock_profile.return_value.get_size.side_effect = RuntimeError("storage unavailable")
+
+            tool = DBFuncTool(mock_connector, agent_config=mock_config)
+
+        assert tool.has_table_semantic_profiles is False
+        assert tool._table_semantic_profiles is None
+
 
 class TestDBFuncToolExecuteDDL:
     """Tests for DBFuncTool.execute_ddl method."""
@@ -500,6 +523,116 @@ class TestDescribeTableDuckDBSchemaPrefix:
 
         assert effective.get("schema_name") == "raw"
         assert effective.get("table_name") == "stage"
+
+
+class TestDescribeTableSemanticProfile:
+    def test_describe_table_enriches_from_table_semantic_profile(self):
+        mock_connector = Mock()
+        mock_connector.dialect = "sqlite"
+        mock_connector.get_databases.return_value = []
+        mock_connector.get_schema.return_value = [
+            {"name": "order_id", "type": "INTEGER", "comment": ""},
+            {"name": "order_date", "type": "DATE", "comment": ""},
+            {"name": "amount", "type": "DOUBLE", "comment": ""},
+        ]
+
+        tool = DBFuncTool(mock_connector)
+        tool._table_semantic_profiles = Mock()
+        tool.has_semantic_models = True
+        tool._semantic_storage = Mock()
+        tool._table_semantic_profiles.get_profile.return_value = {
+            "format": "osi",
+            "physical_table_fq_name": "main.orders",
+            "semantic_model_name": "shop",
+            "dataset_name": "orders",
+            "data_source_name": "",
+            "description": "Orders dataset",
+            "ai_context_json": '{"synonyms": ["purchases"]}',
+            "columns_json": (
+                "["
+                '{"name":"order_id","expr":"order_id","role":"primary_key","description":"Order key"},'
+                '{"name":"order_date","expr":"order_date","role":"time_dimension","description":"Order date"},'
+                '{"name":"amount","expr":"amount","role":"measure","description":"Order amount"}'
+                "]"
+            ),
+            "relationships_json": '[{"name":"orders_to_customers","to_dataset":"customers"}]',
+            "custom_extensions_json": "",
+            "yaml_path": "/tmp/orders.yml",
+        }
+
+        result = tool.describe_table("orders")
+
+        assert result.success == 1
+        tool._semantic_storage.get_semantic_model.assert_not_called()
+        assert result.result["table"] == {
+            "name": "orders",
+            "description": "Orders dataset",
+            "ai_context": {"synonyms": ["purchases"]},
+        }
+        assert result.result["semantic"]["relationships"][0]["name"] == "orders_to_customers"
+        assert "filters" not in result.result["semantic"]
+        assert "format" not in result.result["semantic"]
+        assert "semantic_model_name" not in result.result["semantic"]
+        assert "dataset_name" not in result.result["semantic"]
+        assert "data_source_name" not in result.result["semantic"]
+        assert "physical_table" not in result.result["semantic"]
+        assert "custom_extensions" not in result.result["semantic"]
+        assert "yaml_path" not in result.result["semantic"]
+        columns = {col["name"]: col for col in result.result["columns"]}
+        assert columns["order_id"]["semantic_role"] == "primary_key"
+        assert "is_entity_key" not in columns["order_id"]
+        assert columns["order_date"]["is_dimension"] is True
+        assert columns["amount"]["semantic_role"] == "measure"
+        assert "is_measure" not in columns["amount"]
+        assert columns["amount"]["comment"] == "Order amount"
+
+    def test_describe_table_keeps_metricflow_profile_enrichment(self):
+        mock_connector = Mock()
+        mock_connector.dialect = "sqlite"
+        mock_connector.get_databases.return_value = []
+        mock_connector.get_schema.return_value = [
+            {"name": "order_id", "type": "INTEGER", "comment": ""},
+            {"name": "order_date", "type": "DATE", "comment": ""},
+            {"name": "amount", "type": "DOUBLE", "comment": ""},
+        ]
+
+        tool = DBFuncTool(mock_connector)
+        tool._table_semantic_profiles = Mock()
+        tool._table_semantic_profiles.get_profile.return_value = {
+            "table_name": "orders",
+            "semantic_model_name": "orders_source",
+            "dataset_name": "",
+            "data_source_name": "orders_source",
+            "description": "Orders data source",
+            "ai_context_json": '{"synonyms": ["sales orders"]}',
+            "columns_json": (
+                "["
+                '{"name":"order_id","expr":"order_id","role":"primary_key","description":"Order key"},'
+                '{"name":"order_date","expr":"order_date","role":"time_dimension","description":"Order date"},'
+                '{"name":"amount","expr":"amount","role":"measure","description":"Order amount","agg":"sum"}'
+                "]"
+            ),
+            "relationships_json": '[{"name":"orders_to_customers","to_dataset":"customers"}]',
+        }
+
+        result = tool.describe_table("orders")
+
+        assert result.success == 1
+        assert result.result["table"] == {
+            "name": "orders_source",
+            "description": "Orders data source",
+            "ai_context": {"synonyms": ["sales orders"]},
+        }
+        assert result.result["semantic"] == {
+            "relationships": [{"name": "orders_to_customers", "to_dataset": "customers"}],
+        }
+        columns = {col["name"]: col for col in result.result["columns"]}
+        assert columns["order_date"]["semantic_role"] == "time_dimension"
+        assert columns["order_date"]["is_dimension"] is True
+        assert columns["amount"]["semantic_role"] == "measure"
+        assert columns["amount"]["comment"] == "Order amount"
+        assert "is_measure" not in columns["amount"]
+        assert "is_entity_key" not in columns["order_id"]
 
 
 class TestExecuteDDLDatabaseParam:

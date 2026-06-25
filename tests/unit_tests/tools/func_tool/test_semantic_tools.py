@@ -2,6 +2,7 @@
 Test cases for SemanticTools utility functions and query_metrics compression.
 """
 
+import json
 from enum import Enum
 from unittest.mock import Mock, patch
 
@@ -89,7 +90,7 @@ class TestGenerationEvidence:
             [
                 {
                     "source": "sql_1",
-                    "metric_hints": ["activity_count"],
+                    "metric_hints": ["order_count"],
                     "dimension_hints": ["start_month"],
                     "time_group_hints": [
                         {
@@ -1224,6 +1225,130 @@ class TestQueryMetricsCompression:
             assert result.result["data"]["original_rows"] == 1
             assert result.result["data"]["original_columns"] == ["x"]
 
+    def test_query_metrics_passes_join_controls_to_supporting_adapter(self, semantic_tools):
+        """Test that semantic join controls are forwarded when the adapter supports them."""
+        query_result = QueryResult(columns=["x"], data=[{"x": 1}], metadata={})
+
+        class AdapterWithJoinControls:
+            def __init__(self):
+                self.query_kwargs = None
+
+            def get_dimensions(self, metric_name, path=None):
+                return [{"name": "customer_id__customer_name"}]
+
+            def query_metrics(
+                self,
+                metrics,
+                dimensions=None,
+                path=None,
+                time_start=None,
+                time_end=None,
+                time_granularity=None,
+                where=None,
+                limit=None,
+                order_by=None,
+                join_policy=None,
+                zero_fill=False,
+                dry_run=False,
+            ):
+                self.query_kwargs = {
+                    "metrics": metrics,
+                    "dimensions": dimensions,
+                    "path": path,
+                    "time_start": time_start,
+                    "time_end": time_end,
+                    "time_granularity": time_granularity,
+                    "where": where,
+                    "limit": limit,
+                    "order_by": order_by,
+                    "join_policy": join_policy,
+                    "zero_fill": zero_fill,
+                    "dry_run": dry_run,
+                }
+                return query_result
+
+        adapter = AdapterWithJoinControls()
+        semantic_tools._adapter = adapter
+        with patch(
+            "datus.tools.func_tool.semantic_tools._run_async",
+            side_effect=[
+                [{"name": "customer_id__customer_name"}],
+                query_result,
+            ],
+        ):
+            result = semantic_tools.query_metrics(
+                metrics=["order_count"],
+                dimensions=["customer_id__customer_name"],
+                join_policy="dimension_preserving",
+                zero_fill=True,
+            )
+
+        assert result.success == 1
+        assert adapter.query_kwargs["join_policy"] == "dimension_preserving"
+        assert adapter.query_kwargs["zero_fill"] is True
+
+    def test_query_metrics_passes_join_controls_to_kwargs_adapter(self, semantic_tools):
+        query_result = QueryResult(columns=["x"], data=[{"x": 1}], metadata={})
+
+        class AdapterWithKwargs:
+            def __init__(self):
+                self.query_kwargs = None
+
+            def get_dimensions(self, metric_name, path=None):
+                return [{"name": "customer_id__customer_name"}]
+
+            def query_metrics(self, metrics, dimensions=None, path=None, **kwargs):
+                self.query_kwargs = kwargs
+                return query_result
+
+        adapter = AdapterWithKwargs()
+        semantic_tools._adapter = adapter
+        with patch(
+            "datus.tools.func_tool.semantic_tools._run_async",
+            side_effect=[
+                [{"name": "customer_id__customer_name"}],
+                query_result,
+            ],
+        ):
+            result = semantic_tools.query_metrics(
+                metrics=["order_count"],
+                dimensions=["customer_id__customer_name"],
+                join_policy="dimension_preserving",
+                zero_fill=True,
+            )
+
+        assert result.success == 1
+        assert adapter.query_kwargs["join_policy"] == "dimension_preserving"
+        assert adapter.query_kwargs["zero_fill"] is True
+
+    def test_query_metrics_normalizes_false_zero_fill_before_adapter_gating(self, semantic_tools):
+        query_result = QueryResult(columns=["x"], data=[{"x": 1}], metadata={})
+
+        class AdapterWithoutJoinControls:
+            def get_dimensions(self, metric_name, path=None):
+                return []
+
+            def query_metrics(
+                self,
+                metrics,
+                dimensions=None,
+                path=None,
+                time_start=None,
+                time_end=None,
+                time_granularity=None,
+                where=None,
+                limit=None,
+                order_by=None,
+                dry_run=False,
+            ):
+                return query_result
+
+        semantic_tools._adapter = AdapterWithoutJoinControls()
+        with patch("datus.tools.func_tool.semantic_tools._run_async", return_value=query_result):
+            result = semantic_tools.query_metrics(metrics=["order_count"], zero_fill="false")
+
+        assert result.success == 1
+
 
 # ---------------------------------------------------------------------------
 # Extended fixtures (no adapter_type)
@@ -1692,6 +1817,91 @@ class TestValidateSemantic:
 
         assert result.success == 0
         assert "scope must be one of" in result.error
+
+    def test_passes_checks_and_baseline_to_supported_adapter(self, semantic_tools_with_adapter):
+        tool, _ = semantic_tools_with_adapter
+        calls = {}
+
+        class _Adapter:
+            async def validate_semantic(self, scope="all", checks=None, baseline_artifact=None):
+                calls["scope"] = scope
+                calls["checks"] = checks
+                calls["baseline_artifact"] = baseline_artifact
+                result = Mock()
+                result.valid = True
+                result.issues = []
+                return result
+
+        tool._adapter = _Adapter()
+        baseline = {"version": "0.2.0.dev0", "semantic_model": [{"name": "shop", "datasets": []}]}
+
+        with patch.object(tool, "_reload_adapter", return_value=True):
+            result = tool.validate_semantic(
+                checks="authoring_quality,mutation_guard",
+                baseline_artifact_json=json.dumps(baseline),
+            )
+
+        assert result.success == 1
+        assert result.result["checks"] == ["authoring_quality", "mutation_guard"]
+        assert calls == {
+            "scope": "all",
+            "checks": ["authoring_quality", "mutation_guard"],
+            "baseline_artifact": baseline,
+        }
+
+    def test_passes_validation_options_to_kwargs_adapter(self, semantic_tools_with_adapter):
+        tool, _ = semantic_tools_with_adapter
+        calls = {}
+
+        class _Adapter:
+            async def validate_semantic(self, **kwargs):
+                calls.update(kwargs)
+                result = Mock()
+                result.valid = True
+                result.issues = []
+                return result
+
+        tool._adapter = _Adapter()
+        baseline = {"semantic_model": [{"name": "commerce"}]}
+
+        with patch.object(tool, "_reload_adapter", return_value=True):
+            result = tool.validate_semantic(
+                scope="semantic_model",
+                checks=["authoring_quality"],
+                baseline_artifact_json=json.dumps(baseline),
+            )
+
+        assert result.success == 1
+        assert calls == {
+            "scope": "semantic_model",
+            "checks": ["authoring_quality"],
+            "baseline_artifact": baseline,
+        }
+
+    def test_rejects_checks_when_adapter_does_not_support_them(self, semantic_tools_with_adapter):
+        tool, _ = semantic_tools_with_adapter
+
+        class _Adapter:
+            async def validate_semantic(self, scope="all"):
+                result = Mock()
+                result.valid = True
+                result.issues = []
+                return result
+
+        tool._adapter = _Adapter()
+
+        result = tool.validate_semantic(checks=["authoring_quality"])
+
+        assert result.success == 0
+        assert "checks are not supported" in result.error
+
+    def test_rejects_invalid_baseline_json(self, semantic_tools_with_adapter):
+        tool, _ = semantic_tools_with_adapter
+
+        result = tool.validate_semantic(baseline_artifact_json="{bad")
+
+        assert result.success == 0
+        assert "baseline_artifact_json must be valid JSON" in result.error
 
     def test_exception_returns_failure(self, semantic_tools_with_adapter):
         tool, mock_adapter = semantic_tools_with_adapter
