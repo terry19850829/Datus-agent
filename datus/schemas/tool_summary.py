@@ -201,6 +201,29 @@ def _fmt_execute_ddl(result: Any) -> str:
     return ""
 
 
+def _fmt_execute_sql(result: Any) -> str:
+    """Unified ``execute_sql`` summary — dispatches by result payload shape.
+
+    Read results carry ``compressed_data``/``original_rows``; write results
+    carry a row count; DDL results carry only a ``message``.
+    """
+    if isinstance(result, dict):
+        if "compressed_data" in result or "original_rows" in result:
+            return _fmt_read_query(result)
+        # ``execute_write`` always emits a ``message`` and may legitimately
+        # report ``row_count: None``, so classify a write by its ``sql_type``
+        # (or any row-count key) BEFORE the DDL ``message`` check — otherwise an
+        # INSERT/UPDATE/DELETE with an unknown row count would be mislabeled
+        # "DDL OK".
+        if result.get("sql_type") in {"insert", "update", "delete"} or any(
+            key in result for key in ("row_count", "affected_rows", "rows_affected")
+        ):
+            return _fmt_execute_write(result) or "Write OK"
+        if result.get("message"):
+            return _fmt_execute_ddl(result)
+    return _fmt_read_query(result)
+
+
 def _fmt_describe_table(result: Any) -> str:
     if not isinstance(result, dict):
         return ""
@@ -1126,6 +1149,7 @@ def _register_builtins(registry: ToolSummaryRegistry) -> None:
     """Register every built-in tool formatter."""
     builtins: Dict[str, FormatterFn] = {
         # Database tools
+        "execute_sql": _fmt_execute_sql,
         "read_query": _fmt_read_query,
         "query": _fmt_read_query,
         "execute_write": _fmt_execute_write,

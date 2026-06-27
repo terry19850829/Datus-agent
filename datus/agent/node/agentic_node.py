@@ -3369,7 +3369,7 @@ class AgenticNode(Node):
         Prefers ``all_tools_name()`` (the full surface, independent of
         runtime availability) over ``available_tools()`` so the registry
         also covers method-level wrappers some nodes mount directly (e.g.
-        ``DBFuncTool.execute_ddl`` on gen_job) and conditional tools that
+        ``DBFuncTool.transfer_query_result`` on gen_job) and conditional tools that
         appear only with certain configs. Registering a superset is safe:
         the registry is a name → category lookup consulted per call, so
         names that are never mounted are never queried.
@@ -3449,6 +3449,7 @@ class AgenticNode(Node):
                 fs_policy=self._make_filesystem_policy(),
                 non_interactive=non_interactive,
                 proxied_tool_names=self.proxied_tool_names,
+                project_root=getattr(self.agent_config, "project_root", None),
             )
             logger.debug(
                 f"PermissionHooks attached to node '{self.get_node_name()}' "

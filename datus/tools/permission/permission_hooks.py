@@ -31,6 +31,7 @@ from datus.schemas.interaction_event import InteractionEvent
 from datus.tools.func_tool.fs_path_policy import PathZone, classify_path
 from datus.tools.permission.permission_config import PermissionLevel
 from datus.tools.registry.tool_registry import ToolRegistry
+from datus.utils.constants import SQLType
 
 if TYPE_CHECKING:
     from datus.tools.permission.permission_manager import PermissionManager
@@ -213,6 +214,7 @@ class PermissionHooks(AgentHooks):
         fs_policy: Optional[FilesystemPolicy] = None,
         non_interactive: bool = False,
         proxied_tool_names: Optional[Set[str]] = None,
+        project_root: Optional[str] = None,
     ):
         """Initialize the permission hooks.
 
@@ -244,6 +246,11 @@ class PermissionHooks(AgentHooks):
                 block proxied calls. Passing the same set reference held by the
                 node lets late ``apply_proxy_tools`` invocations be observed
                 without rebuilding the hook.
+            project_root: Workspace root used to resolve a ``.sql`` file
+                reference passed to ``execute_sql``. The SQL permission gate
+                reads the file (same logic as the tool) so a read-only ``.sql``
+                file auto-allows instead of prompting. ``None`` falls back to the
+                current working directory.
         """
         self.broker = broker
         self.permission_manager = permission_manager
@@ -252,6 +259,7 @@ class PermissionHooks(AgentHooks):
         self.fs_policy = fs_policy
         self.non_interactive = non_interactive
         self.proxied_tool_names = proxied_tool_names
+        self.project_root = project_root
 
     # Plan-mode tooling is always allowed regardless of permission profile:
     # ``confirm_plan`` already runs its own user interaction, and ``todo_*``
@@ -302,6 +310,17 @@ class PermissionHooks(AgentHooks):
         #   /Users/foo/secret does not cascade to /Users/foo/other.
         if self.fs_policy is not None and category == "filesystem_tools":
             handled = await self._handle_filesystem_zone(context, tool_name, pattern_name)
+            if handled:
+                return
+
+        # db_tools.execute_sql: statement-type gating overrides rules.
+        #   read-only (SELECT/SHOW/DESCRIBE/EXPLAIN) → bypass; writes (INSERT/
+        #   UPDATE/DELETE), DDL, and unknown/MERGE → ASK (session cache bucketed
+        #   per SQL type), dangerous bypass, non-interactive raise. A ``.sql``
+        #   file is resolved first; an unreadable file or unparseable text falls
+        #   through to UNKNOWN → ASK (fail safe).
+        if category == "db_tools" and tool_name == "execute_sql":
+            handled = await self._handle_sql_permission(context, tool_name, pattern_name)
             if handled:
                 return
 
@@ -627,6 +646,121 @@ class PermissionHooks(AgentHooks):
         except Exception as e:
             logger.error(f"Error in external filesystem confirmation for {tool_name}: {e}")
             return False
+
+    # Read-only SQL statement types that auto-allow under ``execute_sql``.
+    # Everything else (INSERT/UPDATE/DELETE/DDL/MERGE/UNKNOWN) defers to the
+    # normal category-level permission check.
+    _SQL_READONLY_TYPES = frozenset({SQLType.SELECT, SQLType.METADATA_SHOW, SQLType.EXPLAIN})
+
+    async def _handle_sql_permission(self, context: Any, tool_name: str, pattern_name: str) -> bool:
+        """Statement-type gating for ``db_tools.execute_sql`` calls.
+
+        ``execute_sql`` is the unified SQL entry point, so a single static rule
+        cannot express "reads auto-allow, writes ask". This gate inspects the
+        statement type instead:
+
+        * Read-only (SELECT/SHOW/DESCRIBE/EXPLAIN) → auto-allow, unless an
+          explicit DENY rule blocks ``db_tools.execute_sql`` (then defer so the
+          DENY is surfaced).
+        * Writes (INSERT/UPDATE/DELETE), DDL, and unknown/MERGE → category-level
+          rule check for DENY/ALLOW, then ASK with a session cache **bucketed by
+          the concrete SQL type** (``execute_sql.insert`` / ``.update`` /
+          ``.delete`` / ``.ddl`` / ``.merge`` / ``.unknown``). Per-type bucketing
+          matters because ``execute_sql`` is one tool name: an "Always allow"
+          keyed on the bare tool name would let one approved INSERT silently
+          green-light every later DELETE / DROP / MERGE, so each statement type
+          carries its own session approval. ALLOW under dangerous (rule check
+          returns ALLOW), raise when non-interactive.
+
+        A ``.sql`` file reference is resolved (same workspace-relative read as the
+        tool) so the gate classifies the real statement — a read-only ``.sql``
+        file auto-allows instead of prompting. An unreadable file or unparseable
+        text falls through to UNKNOWN → ASK (fail safe).
+
+        Returns ``True`` when the call has been fully handled (read auto-allowed,
+        explicit/dangerous ALLOW, or bucketed ASK approved), ``False`` to let the
+        normal category-level permission check run (surfaces DENY / the
+        standardized non-interactive raise).
+        """
+        from datus.utils.sql_utils import looks_like_sql_file_ref, parse_sql_type, read_workspace_sql_file
+
+        args = self._parse_tool_args(context)
+        if not isinstance(args, dict):
+            return False
+        sql = args.get("sql", "")
+        # Resolve a ``.sql`` file reference to its real (single) statement so the
+        # type detection below sees the SQL, not the path. On any read failure,
+        # leave ``sql`` as-is → UNKNOWN → ASK (fail safe).
+        if isinstance(sql, str) and looks_like_sql_file_ref(sql):
+            try:
+                sql = read_workspace_sql_file(sql.strip(), self.project_root or ".")
+            except Exception as e:
+                logger.debug("execute_sql gate: could not resolve .sql file (%s); treating as UNKNOWN", e)
+        # No dialect available at the hook layer; the keyword fallback in
+        # ``parse_sql_type`` is enough to separate reads from writes/DDL.
+        sql_type = parse_sql_type(sql, "") if isinstance(sql, str) else SQLType.UNKNOWN
+
+        if sql_type in self._SQL_READONLY_TYPES:
+            # Respect an explicit DENY; otherwise reads auto-allow regardless of
+            # profile (there is no static ALLOW rule for execute_sql to rely on).
+            if (
+                self.permission_manager.check_permission("db_tools", pattern_name, self.node_name)
+                == PermissionLevel.DENY
+            ):
+                return False
+            logger.debug("execute_sql read-only (%s): auto-allow", sql_type.value)
+            return True
+
+        # Non-read (write / DDL / unknown). Honour explicit rules first.
+        permission = self.permission_manager.check_permission("db_tools", pattern_name, self.node_name)
+        if permission == PermissionLevel.DENY:
+            # Surface the standardized DENY raise via the main flow.
+            return False
+        if permission == PermissionLevel.ALLOW:
+            # Explicit ALLOW rule or a permissive profile (e.g. dangerous).
+            return True
+
+        # ASK. Non-interactive flows must not prompt — defer so the main flow
+        # raises the standardized non-interactive PermissionDeniedException.
+        if self.non_interactive:
+            return False
+
+        # Bucket the session approval by the concrete SQL type so an "always
+        # allow" only ever covers that one type (e.g. approving an INSERT never
+        # green-lights a later DELETE / DROP / MERGE).
+        sql_class = sql_type.value
+        bucket_pattern = f"execute_sql.{sql_class}"
+        # Honour the per-type bucket plus any deliberately broad session approval
+        # (a prior un-bucketed ``db_tools.execute_sql`` or a category wildcard).
+        # Only the prompt-driven "always allow" below is bucketed per type, so a
+        # single approval never cascades across statement types — but an explicit
+        # broad approval still covers every type.
+        cache_keys = (f"db_tools.{bucket_pattern}", "db_tools.execute_sql", "db_tools.*")
+
+        def _session_approved() -> bool:
+            return any(self.permission_manager._session_approvals.get(key) for key in cache_keys)
+
+        if _session_approved():
+            logger.debug("execute_sql %s already approved for session", sql_class)
+            return True
+
+        async with _get_permission_prompt_lock(self.broker):
+            if _session_approved():
+                return True
+            # Pass the bucketed pattern as the cache key; deliberately omit
+            # ``tool_name`` so "Always allow" caches ONLY ``db_tools.execute_sql.<type>``
+            # and not the un-bucketed ``db_tools.execute_sql`` (which would cascade
+            # across statement types).
+            approved = await self._request_user_confirmation("db_tools", bucket_pattern, context)
+            if not approved:
+                logger.info("User rejected execute_sql (%s)", sql_class)
+                raise PermissionDeniedException(
+                    "User rejected execution of 'execute_sql'",
+                    tool_category="db_tools",
+                    tool_name="execute_sql",
+                )
+            logger.info("User approved execute_sql (%s)", sql_class)
+            return True
 
     def _get_category_and_pattern(self, tool_name: str, context: Any) -> Tuple[str, str]:
         """Get tool category and pattern name for permission checking.
