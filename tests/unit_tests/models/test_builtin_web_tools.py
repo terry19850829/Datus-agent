@@ -56,11 +56,15 @@ def test_openai_search_yes_only_on_official_endpoint():
     assert OpenAIModel.supports_builtin_web_fetch(proxy) is False
 
 
-def test_claude_enables_both():
+def test_claude_search_server_fetch_local():
     s = Mock()
-    # Claude serves both server tools via the native path (OAuth and API key).
+    # web_search runs server-side (Anthropic web_search_20250305, GA). web_fetch
+    # is served by the LOCAL httpx backend instead of the hosted
+    # web_fetch_20250910: the hosted tool emits server_tool_use blocks whose
+    # rehydrated form carries an output-only ``citations`` field the message
+    # input schema rejects on replay (400), so we keep fetch local.
     assert ClaudeModel.supports_builtin_web_search(s) is True
-    assert ClaudeModel.supports_builtin_web_fetch(s) is True
+    assert ClaudeModel.supports_builtin_web_fetch(s) is False
 
 
 def test_describe_hosted_tool_item_web_search_dict():
@@ -137,6 +141,68 @@ def test_summarize_web_tool_result_handles_missing():
     from datus.models.claude_model import summarize_web_tool_result
 
     assert summarize_web_tool_result(None) == ("completed", {})
+
+
+def test_sanitize_server_block_strips_citations_from_server_tool_use():
+    """A rehydrated server_tool_use block carries an output-only ``citations``
+    field (extra='allow'); replaying it verbatim trips a 400. The sanitizer must
+    keep only the input-schema keys."""
+    from anthropic.types import ServerToolUseBlock
+
+    from datus.models.claude_model import sanitize_server_block_for_replay
+
+    block = ServerToolUseBlock(id="srv_1", name="web_search", input={"query": "eth"}, type="server_tool_use")
+    # Simulate the field the streaming accumulator attaches.
+    block.__pydantic_extra__["citations"] = None
+    assert "citations" in block.model_dump(mode="json")  # precondition
+
+    out = sanitize_server_block_for_replay(block)
+    assert out == {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "eth"}}
+    assert "citations" not in out
+
+
+def test_sanitize_server_block_whitelists_web_search_tool_result():
+    """web_search_tool_result keeps only type/tool_use_id/content on replay."""
+    from types import SimpleNamespace
+
+    from datus.models.claude_model import sanitize_server_block_for_replay
+
+    block = SimpleNamespace(
+        model_dump=lambda mode="json": {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srv_1",
+            "content": [{"type": "web_search_result", "title": "t", "url": "https://x"}],
+            "cache_control": {"type": "ephemeral"},  # extra output-only key
+        }
+    )
+    out = sanitize_server_block_for_replay(block)
+    assert set(out) == {"type", "tool_use_id", "content"}
+    assert out["tool_use_id"] == "srv_1"
+
+
+def test_sanitize_server_block_unknown_type_falls_back_to_verbatim():
+    """An unrecognized block type is dumped verbatim (best effort, no data loss)."""
+    from types import SimpleNamespace
+
+    from datus.models.claude_model import sanitize_server_block_for_replay
+
+    dumped = {"type": "some_future_block", "foo": "bar"}
+    block = SimpleNamespace(model_dump=lambda mode="json": dumped)
+    assert sanitize_server_block_for_replay(block) == dumped
+
+
+def test_sanitize_server_block_returns_none_when_unserializable():
+    """A block whose model_dump raises is skipped (returns None) rather than
+    aborting the whole assistant-message rebuild."""
+    from types import SimpleNamespace
+
+    from datus.models.claude_model import sanitize_server_block_for_replay
+
+    def _boom(mode: str = "json") -> dict[str, object]:
+        raise ValueError("not serializable")
+
+    block = SimpleNamespace(type="server_tool_use", model_dump=_boom)
+    assert sanitize_server_block_for_replay(block) is None
 
 
 def test_codex_hosted_completion_attaches_citations():
@@ -287,3 +353,215 @@ def test_describe_hosted_tool_item_ignores_non_web_hosted_calls():
     # the web_search canonical schema by the deferred completion logic).
     for itype in ("file_search_call", "image_generation_call", "code_interpreter_call", "computer_call"):
         assert describe_hosted_tool_item({"type": itype, "id": "x"}) is None
+
+
+def _user_msg(text: str = "explore eth tables") -> dict[str, object]:
+    return {"role": "user", "content": [{"type": "text", "text": text}]}
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_saves_user_and_placeholder():
+    """A turn that raises before normal persistence still commits the user
+    message (plus a non-empty placeholder assistant) so the next turn isn't
+    amnesiac. Role-alternating + non-empty text keeps the replay API-valid."""
+    from unittest.mock import AsyncMock
+
+    session = AsyncMock()
+    frame_locals = {
+        "session": session,
+        "turn_persisted": False,
+        "user_turn_message": _user_msg(),
+        "final_content": "",
+    }
+    await ClaudeModel._persist_failed_turn(Mock(), frame_locals, RuntimeError("boom"))
+
+    session.add_items.assert_awaited_once()
+    items = session.add_items.await_args.args[0]
+    assert [m["role"] for m in items] == ["user", "assistant"]
+    # Placeholder assistant text is non-empty (Anthropic rejects empty text).
+    assert items[1]["content"][0]["text"].strip()
+    assert "RuntimeError" in items[1]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_uses_partial_content():
+    """When the turn produced partial assistant text before failing, that text
+    is preserved rather than replaced by the error placeholder."""
+    from unittest.mock import AsyncMock
+
+    session = AsyncMock()
+    frame_locals = {
+        "session": session,
+        "turn_persisted": False,
+        "user_turn_message": _user_msg(),
+        "final_content": "partial answer so far",
+    }
+    await ClaudeModel._persist_failed_turn(Mock(), frame_locals, RuntimeError("boom"))
+    items = session.add_items.await_args.args[0]
+    assert items[1]["content"][0]["text"] == "partial answer so far"
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_uses_thinking_accumulated_when_final_empty():
+    """On a mid-stream failure ``final_content`` is empty but the visible text
+    lives in ``thinking_accumulated`` — prefer it over the placeholder."""
+    from unittest.mock import AsyncMock
+
+    session = AsyncMock()
+    frame_locals = {
+        "session": session,
+        "turn_persisted": False,
+        "user_turn_message": _user_msg(),
+        "final_content": "",
+        "thinking_accumulated": "streamed-but-not-finalized",
+    }
+    await ClaudeModel._persist_failed_turn(Mock(), frame_locals, RuntimeError("boom"))
+    items = session.add_items.await_args.args[0]
+    assert items[1]["content"][0]["text"] == "streamed-but-not-finalized"
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_preserves_completed_tool_rounds():
+    """When ``messages``/``turn_start_index`` are present, the interrupted turn is
+    rebuilt via ``_replay_safe_turn_items`` so completed tool rounds survive."""
+    from unittest.mock import AsyncMock
+
+    user = _user_msg()
+    session = AsyncMock()
+    frame_locals = {
+        "session": session,
+        "turn_persisted": False,
+        "user_turn_message": user,
+        "final_content": "",
+        "messages": [user, _tool_use_msg("t1"), _tool_result_msg("t1")],
+        "turn_start_index": 0,
+    }
+    # ``_persist_failed_turn`` calls ``self._replay_safe_turn_items`` — wire the
+    # real static method onto the stand-in self so the rebuild actually runs.
+    fake_self = Mock()
+    fake_self._replay_safe_turn_items = ClaudeModel._replay_safe_turn_items
+    await ClaudeModel._persist_failed_turn(fake_self, frame_locals, RuntimeError("boom"))
+    items = session.add_items.await_args.args[0]
+    # Completed tool round preserved, ends on an appended assistant placeholder.
+    assert _tool_use_msg("t1") in items
+    assert items[-1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_skips_when_already_persisted():
+    """The success path already committed the turn; the failure path must not
+    double-write."""
+    from unittest.mock import AsyncMock
+
+    session = AsyncMock()
+    frame_locals = {
+        "session": session,
+        "turn_persisted": True,
+        "user_turn_message": _user_msg(),
+        "final_content": "done",
+    }
+    await ClaudeModel._persist_failed_turn(Mock(), frame_locals, RuntimeError("boom"))
+    session.add_items.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_noop_without_session_or_user_message():
+    """No session (e.g. one-shot call) or a failure before the user message was
+    built → nothing to persist, and no crash."""
+    from unittest.mock import AsyncMock
+
+    # No session.
+    await ClaudeModel._persist_failed_turn(Mock(), {"session": None}, RuntimeError("x"))
+
+    # Session present but exception fired before user_turn_message existed.
+    session = AsyncMock()
+    await ClaudeModel._persist_failed_turn(Mock(), {"session": session, "turn_persisted": False}, RuntimeError("x"))
+    session.add_items.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_failed_turn_swallows_persist_errors():
+    """The fallback must never mask the original error: a failing add_items is
+    logged and swallowed, not raised."""
+    from unittest.mock import AsyncMock
+
+    session = AsyncMock()
+    session.add_items.side_effect = RuntimeError("db locked")
+    frame_locals = {
+        "session": session,
+        "turn_persisted": False,
+        "user_turn_message": _user_msg(),
+        "final_content": "",
+    }
+    # Must complete without re-raising (would otherwise mask the real error)...
+    await ClaudeModel._persist_failed_turn(Mock(), frame_locals, ValueError("original"))
+    # ...while still having attempted the persist exactly once.
+    session.add_items.assert_awaited_once()
+
+
+def _tool_use_msg(tool_id="toolu_1"):
+    return {"role": "assistant", "content": [{"type": "tool_use", "id": tool_id, "name": "execute_sql", "input": {}}]}
+
+
+def _tool_result_msg(tool_id="toolu_1"):
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}
+
+
+def test_replay_safe_turn_items_preserves_completed_rounds():
+    """A finished turn (user → tool_use → tool_result → assistant text) is kept
+    verbatim and ends on the assistant message."""
+    user = _user_msg()
+    final = {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+    turn = [user, _tool_use_msg(), _tool_result_msg(), final]
+    items = ClaudeModel._replay_safe_turn_items(turn, user, "fallback")
+    assert items == turn
+    assert items[-1]["role"] == "assistant"
+
+
+def test_replay_safe_turn_items_drops_dangling_tool_use():
+    """A trailing assistant tool_use with no matching tool_result is dropped, and
+    a non-empty fallback assistant message is appended."""
+    user = _user_msg()
+    turn = [user, _tool_use_msg("toolu_x")]
+    items = ClaudeModel._replay_safe_turn_items(turn, user, "interrupted")
+    assert len(items) == 2
+    assert items[0] == user
+    assert items[1] == {"role": "assistant", "content": [{"type": "text", "text": "interrupted"}]}
+
+
+def test_replay_safe_turn_items_appends_fallback_when_ends_on_user():
+    """A history that ends on a user/tool_result message gets an assistant
+    fallback appended so it never collides with the next turn's user message."""
+    user = _user_msg()
+    answered_use = _tool_use_msg("toolu_1")
+    result = _tool_result_msg("toolu_1")
+    items = ClaudeModel._replay_safe_turn_items([user, answered_use, result], user, "placeholder")
+    assert items[-1] == {"role": "assistant", "content": [{"type": "text", "text": "placeholder"}]}
+    # The answered tool_use round is preserved (not dropped).
+    assert answered_use in items
+
+
+def test_replay_safe_turn_items_empty_falls_back_to_user_plus_assistant():
+    """When everything is dropped, the user message plus a fallback assistant
+    message are restored so the turn is never lost."""
+    user = _user_msg()
+    items = ClaudeModel._replay_safe_turn_items([_tool_use_msg("toolu_x")], user, "")
+    assert items[0] == user
+    assert items[-1] == {"role": "assistant", "content": [{"type": "text", "text": "[empty turn]"}]}
+
+
+def test_replay_safe_turn_items_skips_non_dict_entries():
+    """Non-dict entries in the raw turn slice are filtered out."""
+    user = _user_msg()
+    final = {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+    items = ClaudeModel._replay_safe_turn_items([user, "garbage", None, final], user, "fb")
+    assert items == [user, final]
+
+
+def test_replay_safe_turn_items_tolerates_non_list_assistant_content():
+    """A trailing assistant message whose content is a plain string (not a block
+    list) is treated as having no dangling tool_use and kept as-is."""
+    user = _user_msg()
+    final = {"role": "assistant", "content": "plain string reply"}
+    items = ClaudeModel._replay_safe_turn_items([user, final], user, "fb")
+    assert items == [user, final]
