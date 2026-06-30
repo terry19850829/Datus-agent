@@ -30,6 +30,7 @@ from agents.tool_context import ToolContext
 from agents.usage import InputTokensDetails, OutputTokensDetails, RequestUsage
 
 from datus.configuration.agent_config import ModelConfig
+from datus.models.litellm_adapter import is_official_anthropic_endpoint
 from datus.models.mcp_utils import multiple_mcp_servers
 from datus.models.openai_compatible import OpenAICompatibleModel
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
@@ -275,8 +276,13 @@ class ClaudeModel(OpenAICompatibleModel):
 
     def supports_builtin_web_search(self) -> bool:
         # Anthropic web_search_20250305 (GA) runs server-side via the native path,
-        # which is available for both OAuth and API-key auth. Prefer it over Tavily.
-        return True
+        # which is available for both OAuth and API-key auth. Gate on the official
+        # ``api.anthropic.com`` host: third-party Claude-compatible proxies (e.g.
+        # ``kimi_coding`` at ``api.kimi.com/coding``) share ``type: claude`` but do
+        # not really support the hosted tool — they return malformed
+        # ``server_tool_use`` blocks (missing ``id``) or an empty stub, so those
+        # endpoints fall back to the local Tavily backend instead.
+        return is_official_anthropic_endpoint(self._get_base_url())
 
     def supports_builtin_web_fetch(self) -> bool:
         # web_fetch is served by the LOCAL httpx backend (``web_tool.web_fetch``)
@@ -667,7 +673,7 @@ class ClaudeModel(OpenAICompatibleModel):
                 # web_search_tool_result / web_fetch_tool_result content blocks),
                 # so they are NOT registered in func_tool_map.
                 builtin_web = kwargs.get("builtin_web_tools") or {}
-                if builtin_web.get("web_search"):
+                if builtin_web.get("web_search") and self.supports_builtin_web_search():
                     tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": 5})
                 if builtin_web.get("web_fetch") and self.supports_builtin_web_fetch():
                     tools.append({"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 5})
@@ -758,6 +764,11 @@ class ClaudeModel(OpenAICompatibleModel):
                     emitted_server_ids: set = set()
                     server_tool_names: dict = {}
                     server_tool_queries: dict = {}
+                    # Track the most recent server-tool start id so a result block
+                    # whose ``tool_use_id`` is ``None`` (malformed proxies) pairs back
+                    # to the generated ``srv_*`` id instead of collapsing onto
+                    # ``complete_None`` (which ActionHistoryManager would dedupe away).
+                    last_server_tool_id: Optional[str] = None
                     if self.async_anthropic_client is not None:
                         # Streaming path: yield text deltas as ``thinking_delta``
                         # ActionHistory in real time (parity with
@@ -788,6 +799,7 @@ class ClaudeModel(OpenAICompatibleModel):
                                         sname = getattr(block_start, "name", None) or "web_search"
                                         server_tool_names[sid] = sname
                                         emitted_server_ids.add(sid)
+                                        last_server_tool_id = sid
                                         s_input = getattr(block_start, "input", {}) or {}
                                         if isinstance(s_input, dict):
                                             server_tool_queries[sid] = str(
@@ -803,7 +815,16 @@ class ClaudeModel(OpenAICompatibleModel):
                                             status=ActionStatus.PROCESSING,
                                         )
                                     elif bs_type in ("web_search_tool_result", "web_fetch_tool_result"):
-                                        tid = getattr(block_start, "tool_use_id", None)
+                                        # Malformed proxies (e.g. kimi) echo a result
+                                        # block with a null ``tool_use_id``; fall back
+                                        # to the matching start's generated id so the
+                                        # completion pairs with it and never collapses
+                                        # onto ``complete_None``.
+                                        tid = (
+                                            getattr(block_start, "tool_use_id", None)
+                                            or last_server_tool_id
+                                            or f"srv_{uuid.uuid4().hex[:8]}"
+                                        )
                                         sname = server_tool_names.get(tid, "web_search")
                                         summary, canonical = summarize_web_tool_result(
                                             block_start, query=server_tool_queries.get(tid, "")
@@ -918,19 +939,32 @@ class ClaudeModel(OpenAICompatibleModel):
 
                     # Surface server-side tool calls (Anthropic web_search /
                     # web_fetch) as TOOL ActionHistory. The streaming path already
-                    # emits these in real time (tracked in ``emitted_server_ids``);
-                    # this post-stream pass only covers the non-streaming fallback,
-                    # so it skips ids already emitted to avoid duplicates.
+                    # emits these in real time (tracked in ``emitted_server_ids``),
+                    # so this post-stream pass only covers the non-streaming
+                    # fallback. When streaming ran we skip it entirely: dedup-by-id
+                    # is unreliable for providers (e.g. kimi) that return
+                    # ``server_tool_use`` blocks with a null ``id`` — the streaming
+                    # path substitutes a generated ``srv_*`` id, leaving the
+                    # final-message block's ``id`` as ``None``, which would miss the
+                    # ``emitted_server_ids`` check and re-emit here with
+                    # ``action_id=None`` (crashing ActionHistory validation).
+                    used_streaming = self.async_anthropic_client is not None
                     server_results = {
                         getattr(b, "tool_use_id", None): b
                         for b in message
                         if getattr(b, "type", None) in ("web_search_tool_result", "web_fetch_tool_result")
                     }
                     for block in message:
+                        if used_streaming:
+                            break
                         if getattr(block, "type", None) != "server_tool_use":
                             continue
                         if block.id in emitted_server_ids:
                             continue
+                        # Fall back to a generated id when the provider omits one,
+                        # mirroring the streaming path, so ActionHistory never sees
+                        # a ``None`` action_id.
+                        sid = block.id or f"srv_{uuid.uuid4().hex[:8]}"
                         block_input = getattr(block, "input", {}) or {}
                         s_args = json.dumps(block_input, ensure_ascii=False)[:80]
                         q = (
@@ -940,7 +974,7 @@ class ClaudeModel(OpenAICompatibleModel):
                         )
                         summary, canonical = summarize_web_tool_result(server_results.get(block.id), query=q)
                         start_action = ActionHistory(
-                            action_id=block.id,
+                            action_id=sid,
                             role=ActionRole.TOOL,
                             messages=f"Tool call: {block.name}('{s_args}...')",
                             action_type=block.name,
@@ -952,7 +986,7 @@ class ClaudeModel(OpenAICompatibleModel):
                             action_history_manager.add_action(start_action)
                         yield start_action
                         complete_action = ActionHistory(
-                            action_id=f"complete_{block.id}",
+                            action_id=f"complete_{sid}",
                             role=ActionRole.TOOL,
                             messages=f"Tool call: {block.name}('{s_args}...')",
                             action_type=block.name,

@@ -11,6 +11,7 @@ import time
 import uuid
 from contextlib import nullcontext
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 from agents import Agent, ModelSettings, Runner, SQLiteSession, Tool, WebSearchTool
 from agents.exceptions import MaxTurnsExceeded
@@ -110,8 +111,16 @@ class CodexModel(LLMBaseModel):
         self._prompt_cache_keys: Dict[str, str] = {}
 
     def supports_builtin_web_search(self) -> bool:
-        # OpenAI Responses API exposes a hosted ``web_search`` tool.
-        return True
+        # OpenAI Responses API exposes a hosted ``web_search`` tool, but only the
+        # official ChatGPT Codex backend (``chatgpt.com/backend-api/codex``) honors
+        # it. A custom ``base_url`` points at a third-party relay that may not
+        # support the hosted tool, so gate on the official host and fall back to
+        # the local Tavily backend otherwise.
+        try:
+            hostname = (urlparse(self._base_url).hostname or "").lower() if self._base_url else ""
+        except Exception:
+            return False
+        return hostname == "chatgpt.com"
 
     def supports_builtin_web_fetch(self) -> bool:
         # OpenAI Responses has no hosted fetch tool; web_fetch uses the local backend.
@@ -449,7 +458,7 @@ class CodexModel(LLMBaseModel):
                 agent_kwargs["mcp_servers"] = list(connected_servers.values())
             if tools:
                 agent_kwargs["tools"] = tools
-            if (kwargs.get("builtin_web_tools") or {}).get("web_search"):
+            if (kwargs.get("builtin_web_tools") or {}).get("web_search") and self.supports_builtin_web_search():
                 agent_kwargs["tools"] = [*(agent_kwargs.get("tools") or []), WebSearchTool()]
             if kwargs.get("hooks"):
                 agent_kwargs["hooks"] = kwargs["hooks"]
@@ -539,7 +548,7 @@ class CodexModel(LLMBaseModel):
                 agent_kwargs["mcp_servers"] = list(connected_servers.values())
             if tools:
                 agent_kwargs["tools"] = tools
-            if (kwargs.get("builtin_web_tools") or {}).get("web_search"):
+            if (kwargs.get("builtin_web_tools") or {}).get("web_search") and self.supports_builtin_web_search():
                 agent_kwargs["tools"] = [*(agent_kwargs.get("tools") or []), WebSearchTool()]
             if hooks:
                 agent_kwargs["hooks"] = hooks
