@@ -41,6 +41,7 @@ from datus.cli.action_display.tool_content import (
     _build_list_tables,
     _build_load_skill,
     _build_parse_dates,
+    _build_profile_semantic_model_evidence,
     _build_query_metrics,
     _build_read_file,
     _build_read_query,
@@ -72,6 +73,7 @@ from datus.cli.action_display.tool_content import (
     parse_output_data,
 )
 from datus.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from datus.schemas.tool_summary import TOOL_SUMMARY_REGISTRY
 
 
 def _make(
@@ -1723,6 +1725,24 @@ class TestBuildAnalyzeColumns:
         assert "2 columns analyzed" in tc.compact_result
 
 
+class TestBuildProfileSemanticModelEvidence:
+    def test_compact(self):
+        payload = {
+            "success": 1,
+            "result": {
+                "data_profiled": True,
+                "tables": {"orders": {}, "customers": {}},
+                "summary": "ok",
+            },
+        }
+        a = _make(
+            input_data={"function_name": "profile_semantic_model_evidence"},
+            output_data={"raw_output": json.dumps(payload)},
+        )
+        tc = _build_profile_semantic_model_evidence(a, verbose=False)
+        assert tc.compact_result == TOOL_SUMMARY_REGISTRY.summarize_dict(payload, "profile_semantic_model_evidence")
+
+
 @pytest.mark.ci
 class TestBuildAnalyzeMetricCandidates:
     def test_compact(self):
@@ -1922,6 +1942,7 @@ class TestAllToolsRegistered:
         "analyze_table_relationships",
         "get_multiple_tables_ddl",
         "analyze_column_usage_patterns",
+        "profile_semantic_model_evidence",
         "analyze_metric_candidates_from_history",
         # Skill
         "execute_command",
