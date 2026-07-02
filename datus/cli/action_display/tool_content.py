@@ -13,13 +13,19 @@ Architecture:
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from datus.schemas.action_history import ActionHistory, ActionStatus
 from datus.schemas.tool_summary import TOOL_SUMMARY_REGISTRY
 from datus.utils.loggings import get_logger
+from datus.utils.tool_archive import is_archived_output, parse_archived_marker
 
 logger = get_logger(__name__)
+
+# Max output lines shown inline in a bash compact result before folding into a
+# "… +N lines" row (claude-style).
+COMPACT_MAX_LINES = 3
 
 
 @dataclass
@@ -35,6 +41,12 @@ class ToolCallContent:
     # Compact-mode fields used by the new header + └─ line layout:
     args_summary: str = ""  # concise args for header, e.g. '"orders"' or 'pattern: "*.py"'
     compact_result: str = ""  # concise result for └─ line, e.g. '3 tables: a, b, c'
+    # Optional multi-line compact result (e.g. bash showing the first few output
+    # lines, claude-style). When non-empty the renderer draws one └─ row per
+    # line plus a "… +N lines" overflow row; empty → single-line ``compact_result``
+    # path (unchanged for every other tool).
+    compact_result_lines: List[str] = field(default_factory=list)
+    compact_result_overflow: int = 0  # extra lines beyond those shown
 
 
 # Type alias for custom content builder functions
@@ -56,6 +68,25 @@ def calc_duration(action: ActionHistory) -> str:
             return " (<0.1s)"
         return f" ({duration_sec:.1f}s)"
     return ""
+
+
+def format_running_duration(start_time: Optional[datetime]) -> str:
+    """Elapsed time for a still-running action as a compact whole-second string.
+
+    Used by the PROCESSING frame, which has no ``end_time`` yet. Integer-second
+    granularity (``3s``, ``1m5s``) avoids sub-second flicker at the display's
+    ~4 Hz repaint. Returns ``"0s"`` when ``start_time`` is missing or in the
+    future.
+    """
+    if start_time is None:
+        return "0s"
+    elapsed = int((datetime.now() - start_time).total_seconds())
+    if elapsed < 0:
+        elapsed = 0
+    if elapsed < 60:
+        return f"{elapsed}s"
+    minutes, seconds = divmod(elapsed, 60)
+    return f"{minutes}m{seconds}s"
 
 
 # ── Compact-layout helpers (header args + └─ result line) ──────────
@@ -272,19 +303,34 @@ _TOOL_ARGS_FORMATTERS: Dict[str, Callable[[dict], str]] = {
     "web_fetch": lambda a: _format_positional(a, "url"),
     # Skill tools
     "load_skill": lambda a: _format_positional(a, "skill_name", "name"),
-    "execute_command": lambda a: _format_kw(a, "command"),
+    # Positional (bare quoted value) — the command is the whole point, the
+    # ``command:`` key prefix is just noise in the ``bash(...)`` header.
+    "bash": lambda a: _format_positional(a, "command"),
 }
+
+
+def tool_specific_args_summary(action: ActionHistory) -> str:
+    """Return the per-tool concise args summary, or "" when no formatter applies.
+
+    Shared by the completed-tool header (via ``set_tool_specific_args_summary``)
+    and the running (PROCESSING) frame so both render args the same way — e.g.
+    ``bash("sleep 5")`` rather than ``command: "sleep 5"``.
+    """
+    function_name = action.input.get("function_name", "") if action.input else ""
+    formatter = _TOOL_ARGS_FORMATTERS.get(function_name)
+    if formatter is None:
+        return ""
+    try:
+        return formatter(_parse_args_dict(action)) or ""
+    except Exception:  # pragma: no cover - defensive
+        return ""
 
 
 def set_tool_specific_args_summary(tc: ToolCallContent, action: ActionHistory) -> None:
     """Populate ``tc.args_summary`` using a per-tool formatter when available."""
     if tc.args_summary:
         return
-    function_name = action.input.get("function_name", "") if action.input else ""
-    formatter = _TOOL_ARGS_FORMATTERS.get(function_name)
-    if formatter is None:
-        return
-    summary = formatter(_parse_args_dict(action))
+    summary = tool_specific_args_summary(action)
     if summary:
         tc.args_summary = summary
 
@@ -538,7 +584,7 @@ def _format_result_only_markup(output_data, indent: str = "") -> List[str]:
         return format_output_verbose_markup(output_data, indent)
 
     # If there's an error, show it — but keep going to also surface the
-    # ``result`` payload when present. Tools like ``execute_command`` put the
+    # ``result`` payload when present. Tools like ``bash`` put the
     # actual stdout/stderr in ``result`` while ``error`` is only a terse
     # "Command exited with code N"; returning early here would hide the real
     # failure reason and leave the user with no info to act on.
@@ -1984,25 +2030,44 @@ def _build_analyze_metric_candidates(action: ActionHistory, verbose: bool) -> To
     return tc
 
 
-def _build_execute_command(action: ActionHistory, verbose: bool) -> ToolCallContent:
-    """execute_command: show the real command output, on success and failure.
+def _build_bash(action: ActionHistory, verbose: bool) -> ToolCallContent:
+    """bash: show the real command output, on success and failure.
 
-    The compact line has little room, so surface the meaningful part — the last
-    non-empty output line (the stdout result on success, the stderr reason on
-    failure) — instead of the boilerplate ``Command executed`` label or the
-    ``Command exited with code N`` prefix. When nothing was captured, fall back
-    to the label / error with its generic exception wrapper stripped.
+    The compact line has little room, so surface the meaningful part — the first
+    ``COMPACT_MAX_LINES`` non-empty output lines (the rest folded into a
+    ``… +N lines`` overflow row), covering the stdout result on success and the
+    stderr reason on failure — instead of the boilerplate ``Command executed``
+    label or the ``Command exited with code N`` prefix. Archived (oversized)
+    output shows the marker preview, never the raw marker. When nothing was
+    captured, fall back to the label / error with its generic exception wrapper
+    stripped.
     """
     tc = _build_simple_action(action, verbose, "Command executed")
     if verbose:
         return tc
     data = parse_output_data(action.output)
     output = data.get("result") if isinstance(data, dict) else None
+
+    # Oversized output was offloaded to disk (see BashTool): show the inline
+    # preview split across the first rows, never the raw marker. The full
+    # content is recoverable via ``read_file(<path>)``.
+    if is_archived_output(output):
+        preview = (parse_archived_marker(output) or {}).get("preview", "").strip()
+        tc.compact_result_lines = []
+        if preview:
+            tc.compact_result_lines.append(_truncate_middle(preview, 120))
+        tc.compact_result_lines.append("(large output archived — read_file to view)")
+        tc.compact_result = tc.compact_result_lines[0]
+        return tc
+
     lines: List[str] = []
     if isinstance(output, str) and output.strip():
         lines = [ln for ln in output.splitlines() if ln.strip() and ln.strip() != "[stderr]"]
     if lines:
-        tc.compact_result = _truncate_middle(lines[-1], 80)
+        # Show the first few lines (claude-style), fold the rest into "… +N lines".
+        tc.compact_result_lines = [_truncate_middle(ln, 120) for ln in lines[:COMPACT_MAX_LINES]]
+        tc.compact_result_overflow = max(0, len(lines) - COMPACT_MAX_LINES)
+        tc.compact_result = tc.compact_result_lines[0]  # single-line degrade
     elif tc.status_mark == "✗":
         # No captured output: strip the verbose failure-prefix boilerplate.
         # (Keep "Command exited with code N" / "Command timed out ..." — those
@@ -2199,7 +2264,7 @@ class ToolCallContentBuilder:
         self._registry["analyze_metric_candidates_from_history"] = _build_analyze_metric_candidates
 
         # Skill tools
-        self._registry["execute_command"] = _build_execute_command
+        self._registry["bash"] = _build_bash
         self._registry["load_skill"] = _build_load_skill
 
         # Interaction tools

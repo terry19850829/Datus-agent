@@ -2342,7 +2342,7 @@ class AgenticNode(Node):
 
         Available to every agentic node when ``agent.bash.enabled`` is
         ``True`` (the default). ``allowed_patterns=["*"]`` means the tool
-        exposes ``execute_command`` for any shell command; per-call gating
+        exposes ``bash`` for any shell command; per-call gating
         is the responsibility of the ``bash_tools`` ASK rule in the
         permission profile, not a static pattern whitelist.
 
@@ -2368,14 +2368,40 @@ class AgenticNode(Node):
             self.bash_tool = BashTool(
                 workspace_root=self._resolve_workspace_root(),
                 allowed_patterns=["*"],
+                # Offload oversized command output to the session data dir (the
+                # same location minor compact uses). Resolved lazily: this method
+                # runs before ``session_id`` is finalized, so the closure reads it
+                # at execute time. Returns None until a session id exists → the
+                # tool falls back to in-memory truncation.
+                output_dir_provider=self._bash_output_dir,
             )
             logger.debug(f"Setup bash tool with workspace: {self.bash_tool.workspace_root}")
         except Exception as e:
             logger.error(f"Failed to setup bash tool: {e}")
             self.bash_tool = None
 
+    def _bash_output_dir(self) -> Optional[Path]:
+        """Session data dir for bash output offload, or None if unavailable.
+
+        Reused directory convention as the compact archive
+        (``path_manager.session_data_dir(session_id)``). Returns None before a
+        session id is allocated, when there is no ``agent_config`` (mirrors
+        ``_resolve_session_data_dir`` — otherwise ``get_path_manager`` would fall
+        back to a process-wide default rooted at ``~/.datus``), or when the path
+        manager can't be built, so the bash tool degrades to in-memory truncation.
+        """
+        if not self.agent_config or not self.session_id:
+            return None
+        try:
+            from datus.utils.path_manager import get_path_manager
+
+            return get_path_manager(agent_config=self.agent_config).session_data_dir(self.session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to resolve bash output dir: %s", exc)
+            return None
+
     def _ensure_bash_tool_in_tools(self) -> None:
-        """Ensure the BashTool's ``execute_command`` is in ``self.tools``.
+        """Ensure the BashTool's ``bash`` is in ``self.tools``.
 
         Mirrors :meth:`_ensure_skill_tools_in_tools` — called lazily so the
         late ``setup_tools()`` reset in subclasses doesn't strip the tool.
