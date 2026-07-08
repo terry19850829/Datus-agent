@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from datus.agent.node.semantic_authoring import (
     AUTHORING_FORMAT_METRICFLOW,
     AUTHORING_FORMAT_OSI,
@@ -12,8 +14,10 @@ from datus.agent.node.semantic_authoring import (
     osi_prompt_version,
     osi_template_name,
     resolve_authoring_format,
+    resolve_semantic_adapter_type,
 )
 from datus.prompts.prompt_manager import get_prompt_manager
+from datus.utils.exceptions import DatusException, ErrorCode
 
 
 @dataclass
@@ -27,12 +31,12 @@ def _agent_config(adapter):
     return SimpleNamespace(resolve_semantic_adapter=lambda requested=None: requested or adapter)
 
 
-def test_explicit_node_config_override_wins():
-    assert resolve_authoring_format(_agent_config("metricflow"), {"authoring_format": "osi"}) == AUTHORING_FORMAT_OSI
+def test_legacy_node_config_fields_are_ignored():
     assert (
-        resolve_authoring_format(_agent_config("osi"), {"authoring_format": "metricflow"})
+        resolve_authoring_format(_agent_config("metricflow"), {"authoring_format": "osi"})
         == AUTHORING_FORMAT_METRICFLOW
     )
+    assert resolve_authoring_format(_agent_config("osi"), {"authoring_format": "metricflow"}) == AUTHORING_FORMAT_OSI
 
 
 def test_derives_from_active_semantic_adapter():
@@ -40,8 +44,11 @@ def test_derives_from_active_semantic_adapter():
     assert resolve_authoring_format(_agent_config("metricflow"), None) == AUTHORING_FORMAT_METRICFLOW
 
 
-def test_derives_from_node_semantic_adapter():
-    assert resolve_authoring_format(_agent_config("metricflow"), {"semantic_adapter": "osi"}) == AUTHORING_FORMAT_OSI
+def test_legacy_node_semantic_adapter_is_ignored():
+    assert (
+        resolve_authoring_format(_agent_config("metricflow"), {"semantic_adapter": "osi"})
+        == AUTHORING_FORMAT_METRICFLOW
+    )
 
 
 def test_default_osi_semantic_model_name_uses_database_scope():
@@ -109,24 +116,31 @@ def test_defaults_to_metricflow_when_unknown():
     assert resolve_authoring_format(_agent_config(None), {}) == AUTHORING_FORMAT_METRICFLOW
 
 
-def test_resolution_is_resilient_to_agent_config_errors():
-    def _boom():
-        raise RuntimeError("no semantic layer")
-
-    bad = SimpleNamespace(resolve_semantic_adapter=_boom)
-    assert resolve_authoring_format(bad, None) == AUTHORING_FORMAT_METRICFLOW
-
-
-def test_resolution_logs_agent_config_errors():
+def test_resolution_propagates_agent_config_errors():
     def _boom(_requested=None):
         raise RuntimeError("no semantic layer")
 
     bad = SimpleNamespace(resolve_semantic_adapter=_boom)
-    with patch("datus.agent.node.semantic_authoring.logger") as mock_logger:
-        assert resolve_authoring_format(bad, {"semantic_adapter": "osi"}) == AUTHORING_FORMAT_METRICFLOW
+    with pytest.raises(RuntimeError, match="no semantic layer"):
+        resolve_authoring_format(bad, None)
 
-    mock_logger.debug.assert_called_once()
-    assert "Failed to resolve semantic adapter" in mock_logger.debug.call_args.args[0]
+
+def test_resolution_propagates_semantic_layer_config_errors():
+    def _boom(_requested=None):
+        raise DatusException(ErrorCode.COMMON_CONFIG_ERROR, message="multiple semantic layers")
+
+    bad = SimpleNamespace(resolve_semantic_adapter=_boom)
+    with pytest.raises(DatusException, match="multiple semantic layers"):
+        resolve_authoring_format(bad, None)
+
+
+def test_adapter_type_resolution_propagates_agent_config_errors():
+    def _boom(_requested=None):
+        raise RuntimeError("resolver unavailable")
+
+    bad = SimpleNamespace(resolve_semantic_adapter=_boom)
+    with pytest.raises(RuntimeError, match="resolver unavailable"):
+        resolve_semantic_adapter_type(bad)
 
 
 def test_osi_template_name_is_isolated_from_metricflow_template():

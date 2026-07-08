@@ -146,6 +146,42 @@ metric:
         assert "Refusing to overwrite metric 'order_count'" in result.error
         assert target.read_text(encoding="utf-8") == original
 
+    def test_osi_authoring_skips_metricflow_merge(self, tmp_path):
+        project = tmp_path / "project"
+        target = project / "subject" / "semantic_models" / "ac_manage" / "orders.yml"
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            """
+semantic_model:
+  - name: ac_manage
+    datasets:
+      - name: orders
+        source:
+          table: orders
+""".lstrip(),
+            encoding="utf-8",
+        )
+        tool = MetricFilesystemFuncTool(
+            root_path=str(project),
+            current_node="gen_metrics",
+            authoring_format="osi",
+        )
+        incoming = """
+semantic_model:
+  - name: ac_manage
+    datasets:
+      - name: orders
+        source:
+          table: orders
+        fields:
+          - name: amount
+""".lstrip()
+
+        result = tool.write_file("subject/semantic_models/ac_manage/orders.yml", incoming)
+
+        assert result.success == 1
+        assert target.read_text(encoding="utf-8") == incoming
+
     def test_write_file_strict_external_path_is_rejected_before_merge(self, tmp_path, monkeypatch):
         project = tmp_path / "project"
         project.mkdir()
@@ -453,7 +489,8 @@ class TestStaticHelpers:
         incoming = {"sql_table": "different_table"}
         err = MetricFilesystemFuncTool._merge_stable_scalar(merged, incoming, "sql_table", "orders")
         assert err != ""
-        assert "original_table" in err or "different_table" in err
+        assert "original_table" in err
+        assert "different_table" in err
 
     def test_merge_data_sources_name_conflict_returns_error(self):
         tool = MetricFilesystemFuncTool.__new__(MetricFilesystemFuncTool)

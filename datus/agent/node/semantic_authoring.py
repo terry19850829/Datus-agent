@@ -6,18 +6,15 @@
 
 Datus can author semantic assets in two formats:
 
-- ``metricflow`` (default): the LLM writes MetricFlow YAML directly. This is the
-  original behavior and is left untouched.
+- ``metricflow``: the LLM writes MetricFlow YAML directly. This is the original
+  behavior and is left untouched.
 - ``osi``: the LLM writes OSI semantic models + Datus business hints, which the
   Datus OSI compiler later lowers to a backend (e.g. MetricFlow). The LLM never
   writes backend YAML.
 
-The format is resolved (in priority order) from:
-
-1. an explicit per-node/workflow ``authoring_format`` in ``node_config``;
-2. the active semantic adapter (the consumer of the generated assets) -- when it
-   is ``osi``, author OSI;
-3. the ``metricflow`` default.
+The format is resolved from the global active semantic adapter so semantic model
+generation, metric generation, query, and ask flows stay on one semantic layer
+for a project. Legacy node-level semantic format fields are ignored.
 
 OSI mode uses a *separate* prompt template name (``{node}_osi_system``) so the
 default ``{node}_system`` latest-version scan is never affected.
@@ -37,43 +34,40 @@ AUTHORING_FORMAT_OSI = "osi"
 logger = get_logger(__name__)
 
 
+def _resolve_semantic_adapter(agent_config: Any = None) -> Optional[str]:
+    resolver = getattr(agent_config, "resolve_semantic_adapter", None)
+    if not callable(resolver):
+        return None
+    return resolver(None)
+
+
 def resolve_authoring_format(
     agent_config: Any = None,
     node_config: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Resolve the semantic authoring format. Defaults to ``metricflow``."""
-    if node_config:
-        explicit = node_config.get("authoring_format")
-        if explicit:
-            normalized = str(explicit).strip().lower()
-            if normalized in (AUTHORING_FORMAT_METRICFLOW, AUTHORING_FORMAT_OSI):
-                return normalized
+    """Resolve the semantic authoring format from the global semantic adapter."""
+    del node_config
 
-    adapter: Optional[str] = None
-    adapter_type: Optional[str] = None
-    if node_config:
-        adapter_type = node_config.get("semantic_adapter") or node_config.get("adapter_type")
-    if agent_config is not None and hasattr(agent_config, "resolve_semantic_adapter"):
-        try:
-            adapter = agent_config.resolve_semantic_adapter(adapter_type)
-        except Exception as exc:
-            logger.debug(
-                "Failed to resolve semantic adapter for authoring format; "
-                "falling back to metricflow. adapter_type=%r agent_config=%r error=%s",
-                adapter_type,
-                agent_config,
-                exc,
-            )
-            adapter = None
+    adapter = _resolve_semantic_adapter(agent_config)
 
     if adapter and str(adapter).strip().lower() == AUTHORING_FORMAT_OSI:
         return AUTHORING_FORMAT_OSI
     return AUTHORING_FORMAT_METRICFLOW
 
 
+def resolve_semantic_adapter_type(agent_config: Any = None) -> str:
+    """Resolve the active semantic adapter, defaulting to MetricFlow."""
+    adapter = _resolve_semantic_adapter(agent_config)
+    normalized = str(adapter or "").strip().lower()
+    if normalized:
+        return normalized
+    return AUTHORING_FORMAT_METRICFLOW
+
+
 def is_osi_authoring(agent_config: Any = None, node_config: Optional[Dict[str, Any]] = None) -> bool:
     """Return ``True`` when this node should author OSI instead of MetricFlow."""
-    return resolve_authoring_format(agent_config, node_config) == AUTHORING_FORMAT_OSI
+    del node_config
+    return resolve_authoring_format(agent_config) == AUTHORING_FORMAT_OSI
 
 
 def _normalize_model_name(value: Any) -> str:
