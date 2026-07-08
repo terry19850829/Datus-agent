@@ -913,7 +913,7 @@ class TestAnalyzeMetricCandidatesFromHistory:
         assert row_count["window"] == "3 months"
         assert row_count["window_aggregation"] == "row_count"
 
-    def test_lag_period_aggregation_becomes_previous_and_delta_metrics(self):
+    def test_lag_period_aggregation_becomes_fixed_period_metrics(self):
         tools = _make_tools()
         result = tools.analyze_metric_candidates_from_history(
             sql_queries=[
@@ -945,35 +945,32 @@ class TestAnalyzeMetricCandidatesFromHistory:
         )
 
         assert result.success == 1
-        assert [candidate["name"] for candidate in result.result["direct_metric_candidates"]] == ["order_count"]
+        direct = {candidate["name"]: candidate for candidate in result.result["direct_metric_candidates"]}
+        assert sorted(direct) == ["order_count", "order_count_period_delta", "order_count_previous_period"]
+        assert result.result["derived_metric_candidates"] == []
 
-        derived = {candidate["name"]: candidate for candidate in result.result["derived_metric_candidates"]}
-        assert sorted(derived) == ["order_count_period_delta", "order_count_previous_period"]
+        previous = direct["order_count_previous_period"]
+        assert previous["metric_type"] == "period_over_period"
+        assert previous["expression"] == "COUNT(DISTINCT order_id)"
+        assert previous["time_dimension"] == "order_date"
+        assert previous["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "previous_value",
+        }
+        assert "inputs" not in previous
 
-        previous = derived["order_count_previous_period"]
-        assert previous["metric_type"] == "derived"
-        assert previous["metric_kind"] == "derived"
-        assert previous["expression"] == "order_count_previous_period"
-        assert previous["inputs"] == [
-            {
-                "name": "order_count",
-                "alias": "order_count_previous_period",
-                "offset_window": "1 month",
-            }
-        ]
-
-        delta = derived["order_count_period_delta"]
-        assert delta["metric_type"] == "derived"
-        assert delta["metric_kind"] == "derived"
-        assert delta["expression"] == "order_count - order_count_previous_period"
-        assert delta["inputs"] == [
-            {"name": "order_count"},
-            {
-                "name": "order_count",
-                "alias": "order_count_previous_period",
-                "offset_window": "1 month",
-            },
-        ]
+        delta = direct["order_count_period_delta"]
+        assert delta["metric_type"] == "period_over_period"
+        assert delta["expression"] == "COUNT(DISTINCT order_id)"
+        assert delta["source_expression"] == "order_count - order_count_previous_period"
+        assert delta["time_dimension"] == "order_date"
+        assert delta["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "delta",
+        }
+        assert "inputs" not in delta
 
     def test_period_shift_source_lookup_accepts_legacy_from_key(self):
         from sqlglot import parse_one
@@ -1027,23 +1024,29 @@ class TestAnalyzeMetricCandidatesFromHistory:
         )
 
         assert result.success == 1
-        derived = {candidate["name"]: candidate for candidate in result.result["derived_metric_candidates"]}
-        assert sorted(derived) == ["order_count_mom_delta", "previous_month_order_count"]
-        assert derived["previous_month_order_count"]["inputs"] == [
-            {
-                "name": "order_count",
-                "alias": "previous_month_order_count",
-                "offset_window": "1 month",
-            }
-        ]
-        assert derived["order_count_mom_delta"]["inputs"] == [
-            {"name": "order_count"},
-            {
-                "name": "order_count",
-                "alias": "previous_month_order_count",
-                "offset_window": "1 month",
-            },
-        ]
+        direct = {candidate["name"]: candidate for candidate in result.result["direct_metric_candidates"]}
+        assert sorted(direct) == ["order_count_mom_delta", "previous_month_order_count"]
+        assert result.result["derived_metric_candidates"] == []
+
+        previous = direct["previous_month_order_count"]
+        assert previous["metric_type"] == "period_over_period"
+        assert previous["expression"] == "COUNT(DISTINCT order_id)"
+        assert previous["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "previous_value",
+        }
+        assert "inputs" not in previous
+
+        delta = direct["order_count_mom_delta"]
+        assert delta["metric_type"] == "period_over_period"
+        assert delta["expression"] == "COUNT(DISTINCT order_id)"
+        assert delta["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "delta",
+        }
+        assert "inputs" not in delta
 
     def test_inline_lag_metric_math_uses_source_time_grain_context(self):
         tools = _make_tools()
@@ -1070,20 +1073,184 @@ class TestAnalyzeMetricCandidatesFromHistory:
         assert result.success == 1
         matches = [
             candidate
-            for candidate in result.result["derived_metric_candidates"]
+            for candidate in result.result["direct_metric_candidates"]
             if candidate["name"] == "order_count_period_delta"
         ]
         assert len(matches) == 1
         delta = matches[0]
-        assert delta["expression"] == "order_count - order_count_prev"
-        assert delta["inputs"] == [
-            {"name": "order_count"},
-            {
-                "name": "order_count",
-                "alias": "order_count_prev",
-                "offset_window": "1 month",
-            },
+        assert delta["metric_type"] == "period_over_period"
+        assert delta["expression"] == "COUNT(DISTINCT order_id)"
+        assert delta["source_expression"] == "order_count - order_count_prev"
+        assert delta["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "delta",
+        }
+        assert "inputs" not in delta
+
+    def test_inline_lag_aliases_do_not_leak_to_later_plain_columns(self):
+        tools = _make_tools()
+        result = tools.analyze_metric_candidates_from_history(
+            sql_queries=[
+                """
+                WITH monthly_orders AS (
+                    SELECT
+                        DATE_TRUNC('month', order_date) AS metric_month,
+                        COUNT(DISTINCT order_id) AS order_count,
+                        SUM(previous_count) AS order_count_prev
+                    FROM fact_orders
+                    GROUP BY DATE_TRUNC('month', order_date)
+                )
+                SELECT
+                    metric_month,
+                    order_count - LAG(order_count) OVER (ORDER BY metric_month) AS order_count_period_delta,
+                    order_count_prev
+                FROM monthly_orders
+                ORDER BY metric_month
+                """
+            ]
+        )
+
+        assert result.success == 1
+        direct = result.result["direct_metric_candidates"]
+        delta = next(candidate for candidate in direct if candidate["name"] == "order_count_period_delta")
+        assert delta["metric_type"] == "period_over_period"
+        assert delta["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "delta",
+        }
+        leaked = [
+            candidate
+            for candidate in direct
+            if candidate["name"] == "order_count_prev" and candidate.get("metric_type") == "period_over_period"
         ]
+        assert leaked == []
+
+    def test_lag_percent_change_becomes_fixed_period_metric(self):
+        tools = _make_tools()
+        result = tools.analyze_metric_candidates_from_history(
+            sql_queries=[
+                """
+                WITH monthly_orders AS (
+                    SELECT
+                        DATE_TRUNC('month', order_date) AS metric_month,
+                        COUNT(DISTINCT order_id) AS order_count
+                    FROM fact_orders
+                    GROUP BY DATE_TRUNC('month', order_date)
+                ),
+                compared AS (
+                    SELECT
+                        metric_month,
+                        order_count,
+                        LAG(order_count) OVER (ORDER BY metric_month) AS previous_month_order_count
+                    FROM monthly_orders
+                )
+                SELECT
+                    metric_month,
+                    order_count,
+                    (order_count - previous_month_order_count) * 1.0
+                        / NULLIF(previous_month_order_count, 0) AS order_count_mom_percent_change
+                FROM compared
+                ORDER BY metric_month
+                """
+            ]
+        )
+
+        assert result.success == 1
+        percent_change = next(
+            candidate
+            for candidate in result.result["direct_metric_candidates"]
+            if candidate["name"] == "order_count_mom_percent_change"
+        )
+        assert percent_change["metric_type"] == "period_over_period"
+        assert percent_change["expression"] == "COUNT(DISTINCT order_id)"
+        assert percent_change["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "percent_change",
+        }
+        assert "inputs" not in percent_change
+
+    def test_lag_ratio_becomes_fixed_period_metric(self):
+        tools = _make_tools()
+        result = tools.analyze_metric_candidates_from_history(
+            sql_queries=[
+                """
+                WITH monthly_orders AS (
+                    SELECT
+                        DATE_TRUNC('month', order_date) AS metric_month,
+                        COUNT(DISTINCT order_id) AS order_count
+                    FROM fact_orders
+                    GROUP BY DATE_TRUNC('month', order_date)
+                ),
+                compared AS (
+                    SELECT
+                        metric_month,
+                        order_count,
+                        LAG(order_count) OVER (ORDER BY metric_month) AS previous_month_order_count
+                    FROM monthly_orders
+                )
+                SELECT
+                    metric_month,
+                    order_count,
+                    order_count * 1.0 / NULLIF(previous_month_order_count, 0) AS order_count_mom_ratio
+                FROM compared
+                ORDER BY metric_month
+                """
+            ]
+        )
+
+        assert result.success == 1
+        ratio = next(
+            candidate
+            for candidate in result.result["direct_metric_candidates"]
+            if candidate["name"] == "order_count_mom_ratio"
+        )
+        assert ratio["metric_type"] == "period_over_period"
+        assert ratio["expression"] == "COUNT(DISTINCT order_id)"
+        assert ratio["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "ratio",
+        }
+        assert "inputs" not in ratio
+
+    def test_lag_with_explicit_offset_count_sets_offset_window(self):
+        tools = _make_tools()
+        result = tools.analyze_metric_candidates_from_history(
+            sql_queries=[
+                """
+                WITH monthly_orders AS (
+                    SELECT
+                        DATE_TRUNC('month', order_date) AS metric_month,
+                        COUNT(DISTINCT order_id) AS order_count
+                    FROM fact_orders
+                    GROUP BY DATE_TRUNC('month', order_date)
+                )
+                SELECT
+                    metric_month,
+                    order_count,
+                    LAG(order_count, 2) OVER (ORDER BY metric_month) AS order_count_two_months_ago
+                FROM monthly_orders
+                ORDER BY metric_month
+                """
+            ]
+        )
+
+        assert result.success == 1
+        previous = next(
+            candidate
+            for candidate in result.result["direct_metric_candidates"]
+            if candidate["name"] == "order_count_two_months_ago"
+        )
+        assert previous["metric_type"] == "period_over_period"
+        assert previous["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "2 months",
+            "calculation": "previous_value",
+        }
+        assert "inputs" not in previous
 
     def test_period_shift_aliases_are_scoped_to_source_select(self):
         tools = _make_tools()
@@ -1132,17 +1299,16 @@ class TestAnalyzeMetricCandidatesFromHistory:
         assert result.success == 1
         delta = next(
             candidate
-            for candidate in result.result["derived_metric_candidates"]
+            for candidate in result.result["direct_metric_candidates"]
             if candidate["name"] == "order_count_period_delta"
         )
-        assert delta["inputs"] == [
-            {"name": "order_count"},
-            {
-                "name": "order_count",
-                "alias": "order_count_previous_period",
-                "offset_window": "1 month",
-            },
-        ]
+        assert delta["metric_type"] == "period_over_period"
+        assert delta["period_over_period"] == {
+            "time_grain": "month",
+            "offset_window": "1 month",
+            "calculation": "delta",
+        }
+        assert "inputs" not in delta
 
     def test_conditional_aggregation_keeps_case_measure_evidence(self):
         tools = _make_tools()
@@ -1346,6 +1512,23 @@ class TestAnalyzeMetricCandidatesFromHistory:
         assert {candidate["expression"] for candidate in candidates} == {"COUNT(*)", "SUM(amount)"}
         assert all(candidate["name"] == "revenue" for candidate in candidates)
         assert all(candidate["source_count"] == 1 for candidate in candidates)
+
+    def test_period_over_period_merge_key_includes_time_dimension(self):
+        tools = _make_tools()
+        candidate = {
+            "name": "order_count_yoy",
+            "metric_type": "period_over_period",
+            "expression": "COUNT(DISTINCT order_id)",
+            "time_dimension": "order_date",
+            "period_over_period": {
+                "time_grain": "month",
+                "offset_window": "1 year",
+                "calculation": "percent_change",
+            },
+        }
+        alternate = {**candidate, "time_dimension": "ship_date"}
+
+        assert tools._metric_candidate_merge_key(candidate) != tools._metric_candidate_merge_key(alternate)
 
     def test_repeated_blocked_candidates_do_not_reappear_as_direct_candidates(self):
         tools = _make_tools()
