@@ -60,39 +60,53 @@ agent:
       model: claude      # Optional: defaults to configured model
       max_turns: 30      # Optional: defaults to 30
       semantic_adapter: metricflow   # Optional when only one semantic layer is configured
-      # Optional: enable historical SQL profiling before YAML generation.
-      # Keep the default MetricFlow semantic-model skill when overriding skills.
-      skills: "metricflow-semantic-authoring, semantic-sql-history-profiler"
 ```
 
 See [Semantic Layer Configuration](../configuration/semantic_layer.md) for the full set of options.
 
 For OSI generation, see [OSI Semantic Adapter](../adapters/osi_semantic_adapter.md).
 
-### Optional Historical SQL Profiling
+### Skills (automatic)
 
-`semantic-sql-history-profiler` is an internal skill for `gen_semantic_model`, not a chat command or user-invocable skill. Enable it on the `gen_semantic_model` node when you want semantic-model generation to use historical SQL or success-story SQL as modeling evidence.
+You never configure `skills:` — the assistant picks the right ones from the active semantic adapter:
 
-When the skill is available and the request includes historical SQL or success-story SQL, the subagent loads it before generating YAML and calls `profile_semantic_model_evidence`. The evidence is used to infer join relationships, commonly filtered or grouped dimensions, aggregate candidates, time fields, compact distribution notes, and relationship reliability hints.
+- The matching authoring guide (`metricflow-semantic-authoring` or `osi-semantic-authoring`) is always applied.
+- A historical-SQL profiler is available on demand (see below).
 
-For MetricFlow generation, keep the default MetricFlow semantic-model skill when you override `skills`:
+To customize: set `skills: ""` to disable the optional profiler, or drop a folder with the same name under `./.datus/skills/` to replace a built-in guide with your own.
+
+### Triggering historical-SQL profiling
+
+By default the assistant models a table from its DDL and column comments — fast, no extra steps. When you want it to also mine your historical queries or sample real data distributions, **just ask for it in your request**:
+
+| What you want | Example request |
+|---|---|
+| Model from DDL only (default) | `/gen_semantic_model generate a semantic model for orders` |
+| Use past queries as modeling evidence | `/gen_semantic_model model orders and its joins; analyze these queries first: <paste SQL>` |
+| Sample real value distributions | `/gen_semantic_model model orders and profile its column statistics before writing the model` |
+
+Pasting SQL alone does **not** trigger profiling — the assistant still reads it as context, but only runs the profiler when you explicitly ask to analyze or profile. This keeps everyday generation quick.
+
+When profiling runs, its findings (value ranges, null rates, distinct counts, common filters, join reliability) are folded into the field descriptions. For example, a field the assistant would normally write as:
 
 ```yaml
-agent:
-  agentic_nodes:
-    gen_semantic_model:
-      semantic_adapter: metricflow
-      skills: "metricflow-semantic-authoring, semantic-sql-history-profiler"
+- name: amount
+  expression:
+    dialects:
+      - dialect: ANSI_SQL
+        expression: amount
+  dimension:
+    is_time: false
+  description: "Order amount"
+  custom_extensions:
+    - vendor_name: DATUS
+      data: '{"type":"numeric"}'
 ```
 
-For OSI generation, enable only the profiler unless you intentionally need another skill:
+becomes, after profiling, self-documenting with observed evidence:
 
 ```yaml
-agent:
-  agentic_nodes:
-    gen_semantic_model:
-      semantic_adapter: osi
-      skills: "semantic-sql-history-profiler"
+  description: "Order amount; observed range 0–9,999, p50 ≈ 120; ~0.3% null"
 ```
 
 **Built-in configurations** (automatically enabled):

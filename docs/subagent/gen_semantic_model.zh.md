@@ -58,39 +58,53 @@ agent:
       model: claude      # 可选：默认使用已配置的模型
       max_turns: 30      # 可选：默认为 30
       semantic_adapter: metricflow   # 当仅配置了一个 semantic layer 时可省略
-      # 可选：在生成 YAML 前启用历史 SQL profiling。
-      # 覆盖 skills 时，需要同时保留默认的 MetricFlow 语义模型 skill。
-      skills: "metricflow-semantic-authoring, semantic-sql-history-profiler"
 ```
 
 完整配置项见 [语义层配置](../configuration/semantic_layer.zh.md)。
 
 OSI 生成见 [OSI 语义适配器](../adapters/osi_semantic_adapter.zh.md)。
 
-### 可选的历史 SQL Profiling
+### Skills（自动装配）
 
-`semantic-sql-history-profiler` 是 `gen_semantic_model` 使用的内部 skill，不是聊天命令，也不能由用户直接调用。需要让语义模型生成基于历史 SQL 或 success-story SQL 做建模证据分析时，可以在 `gen_semantic_model` 节点上启用它。
+你无需配置 `skills:`——助手会根据当前激活的 semantic adapter 自动选择：
 
-当该 skill 可用，并且请求中包含历史 SQL 或 success-story SQL 时，subagent 会在生成 YAML 前加载它，并调用 `profile_semantic_model_evidence`。这些证据会用于推断 JOIN 关系、常见过滤或分组维度、聚合候选、时间字段、简洁的数据分布说明，以及关系可靠性提示。
+- 对应格式的建模规范（`metricflow-semantic-authoring` 或 `osi-semantic-authoring`）始终生效。
+- 一个历史 SQL profiler 按需可用（见下文）。
 
-MetricFlow 生成场景下，如果覆盖 `skills`，需要把默认语义模型 skill 一起列出：
+如需自定义：设置 `skills: ""` 关闭可选 profiler；或在 `./.datus/skills/` 下放一个同名目录，用你自己的规范替换内置的。
+
+### 触发历史 SQL profiling
+
+默认情况下，助手只根据表的 DDL 和列注释建模——快、无需额外步骤。当你希望它同时挖掘历史查询或采样真实数据分布时，**在请求里直接说出来即可**：
+
+| 你想要 | 请求示例 |
+|---|---|
+| 仅按 DDL 建模（默认） | `/gen_semantic_model 为 orders 生成语义模型` |
+| 用历史查询作为建模证据 | `/gen_semantic_model 为 orders 及其 join 建模；先分析这些查询：<粘贴 SQL>` |
+| 采样真实值分布 | `/gen_semantic_model 为 orders 建模，写模型前先 profile 一下列的统计信息` |
+
+仅粘贴 SQL **不会**触发 profiling——助手仍会把它当作上下文阅读，但只有你明确要求分析或 profile 时才会真正运行 profiler。这让日常生成保持快速。
+
+profiling 运行时，其发现（取值范围、空值率、去重基数、常见过滤、join 可靠性）会被融入字段 description。例如，助手原本会写成：
 
 ```yaml
-agent:
-  agentic_nodes:
-    gen_semantic_model:
-      semantic_adapter: metricflow
-      skills: "metricflow-semantic-authoring, semantic-sql-history-profiler"
+- name: amount
+  expression:
+    dialects:
+      - dialect: ANSI_SQL
+        expression: amount
+  dimension:
+    is_time: false
+  description: "订单金额"
+  custom_extensions:
+    - vendor_name: DATUS
+      data: '{"type":"numeric"}'
 ```
 
-OSI 生成场景下，除非明确需要其他 skill，通常只启用 profiler：
+profiling 后，会带上观测证据、自解释：
 
 ```yaml
-agent:
-  agentic_nodes:
-    gen_semantic_model:
-      semantic_adapter: osi
-      skills: "semantic-sql-history-profiler"
+  description: "订单金额；观测范围 0–9999，p50 ≈ 120；约 0.3% 为空"
 ```
 
 **内置配置**（自动启用）：
