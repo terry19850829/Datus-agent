@@ -19,9 +19,10 @@ from datus.models.base import LLMBaseModel
 from datus.schemas.action_history import ActionHistory, ActionHistoryManager
 from datus.schemas.batch_events import BatchEvent, BatchStage
 from datus.schemas.node_models import SqlTask
+from datus.storage.kb_retrieval import KbSearchMode, metadata_fts_enabled, resolve_kb_search_mode
 from datus.storage.metric.metric_init import init_semantic_yaml_metrics, init_success_story_metrics
 from datus.storage.metric.store import MetricRAG
-from datus.storage.schema_metadata import SchemaWithValueRAG
+from datus.storage.schema_metadata import SchemaWithValueRAG, create_metadata_rag
 from datus.storage.schema_metadata.benchmark_init import init_snowflake_schema
 from datus.storage.schema_metadata.benchmark_init_bird import init_dev_schema
 from datus.storage.schema_metadata.local_init import init_local_schema
@@ -417,28 +418,46 @@ class Agent:
             # db_name = component_dirs[component]``
             # Initialize corresponding stores
             if component == "metadata":
+                use_fts_metadata = metadata_fts_enabled(self.global_config)
+                search_mode = resolve_kb_search_mode(self.global_config)
+                needs_database_storage = not use_fts_metadata
                 if kb_update_strategy == "check":
                     if not os.path.exists(dir_path):
                         raise ValueError("metadata is not built, please run bootstrap_kb with overwrite strategy first")
                     else:
-                        self.global_config.check_init_storage_config("database")
+                        if needs_database_storage:
+                            self.global_config.check_init_storage_config("database")
 
-                        self.metadata_store = SchemaWithValueRAG(self.global_config)
+                        self.metadata_store = (
+                            create_metadata_rag(self.global_config)
+                            if use_fts_metadata
+                            else SchemaWithValueRAG(self.global_config)
+                        )
+                        if use_fts_metadata:
+                            self.metadata_store.check_ready()
                         result = {
                             "status": "success",
                             "message": f"current metadata is already built, "
                             f"dir_path={dir_path},"
+                            f"search_mode={search_mode}, "
                             f"schema_size={self.metadata_store.get_schema_size()}, "
                             f"value_size={self.metadata_store.get_value_size()}",
                         }
                         results[component] = result
                         continue
 
-                if kb_update_strategy == "overwrite":
-                    self.global_config.save_storage_config("database")
-                else:
-                    self.global_config.check_init_storage_config("database")
-                self.metadata_store = SchemaWithValueRAG(self.global_config)
+                if needs_database_storage:
+                    if kb_update_strategy == "overwrite":
+                        self.global_config.save_storage_config("database")
+                    else:
+                        self.global_config.check_init_storage_config("database")
+                self.metadata_store = (
+                    create_metadata_rag(self.global_config)
+                    if use_fts_metadata
+                    else SchemaWithValueRAG(self.global_config)
+                )
+                if use_fts_metadata and kb_update_strategy == "incremental":
+                    self.metadata_store.check_ready()
                 if kb_update_strategy == "overwrite":
                     self.metadata_store.truncate()
 
@@ -488,6 +507,7 @@ class Agent:
                 result = {
                     "status": "success",
                     "message": f"metadata bootstrap completed, "
+                    f"search_mode={search_mode}, "
                     f"schema_size={self.metadata_store.get_schema_size()}, "
                     f"value_size={self.metadata_store.get_value_size()}",
                 }
@@ -748,7 +768,8 @@ class Agent:
             self.global_config.check_init_storage_config("metric")
             result = self.benchmark_semantic_layer(benchmark_path, target_task_ids, run_id=run_id)
         else:
-            self.global_config.check_init_storage_config("database")
+            if resolve_kb_search_mode(self.global_config) == KbSearchMode.VECTOR:
+                self.global_config.check_init_storage_config("database")
             self.global_config.check_init_storage_config("metric")
             result = self.do_benchmark(benchmark_platform, target_task_ids, run_id=run_id)
         end = time.perf_counter()

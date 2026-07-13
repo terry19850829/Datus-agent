@@ -23,6 +23,7 @@ from datus.configuration.agent_config import (
     DatasetDbConfig,
     DbConfig,
     DocumentConfig,
+    KbSearchConfig,
     ModelConfig,
     NodeConfig,
     ServicesConfig,
@@ -1363,7 +1364,7 @@ class TestAgentConfigApiSection:
 
 
 class TestAgentConfigKnowledgeBase:
-    def _make(self, tmp_path, knowledge_base=None):
+    def _make(self, tmp_path, knowledge_base=None, kb=None):
         kwargs = dict(
             nodes={"test": NodeConfig(model="test-model", input=None)},
             home=str(tmp_path / "h"),
@@ -1380,6 +1381,8 @@ class TestAgentConfigKnowledgeBase:
         )
         if knowledge_base is not None:
             kwargs["knowledge_base"] = knowledge_base
+        if kb is not None:
+            kwargs["kb"] = kb
         return AgentConfig(**kwargs)
 
     def test_knowledge_base_config_resolves_nested_env_values(self, tmp_path, monkeypatch):
@@ -1395,6 +1398,47 @@ class TestAgentConfigKnowledgeBase:
         cfg = self._make(tmp_path, knowledge_base="bad")
 
         assert cfg.knowledge_base == {}
+
+    def test_kb_config_rejects_non_dict(self, tmp_path):
+        cfg = self._make(tmp_path, kb="bad")
+
+        assert cfg.kb_search == KbSearchConfig(mode="vector")
+        assert cfg.kb_search_mode == "vector"
+
+    def test_kb_search_defaults_to_vector(self, tmp_path):
+        cfg = self._make(tmp_path)
+
+        assert cfg.kb_search == KbSearchConfig(mode="vector")
+        assert cfg.kb_search_mode == "vector"
+        assert not hasattr(cfg, "_metadata_fts_enabled")
+
+    def test_kb_search_ignores_removed_enabled_flag(self, tmp_path):
+        cfg = self._make(tmp_path, kb={"search": {"enabled": "false", "mode": "fts"}})
+
+        assert cfg.kb_search == KbSearchConfig(mode="fts")
+        assert cfg.kb_search_mode == "fts"
+
+    def test_kb_search_accepts_explicit_fts_mode(self, tmp_path):
+        cfg = self._make(tmp_path, kb={"search": {"mode": "fts"}})
+
+        assert cfg.kb_search_mode == "fts"
+
+    def test_kb_search_keeps_legacy_knowledge_base_search_compatibility(self, tmp_path):
+        cfg = self._make(tmp_path, knowledge_base={"search": {"mode": "fts"}})
+
+        assert cfg.kb_search_mode == "fts"
+
+    def test_kb_search_rejects_hybrid_mode(self, tmp_path):
+        with pytest.raises(DatusException):
+            self._make(tmp_path, kb={"search": {"mode": "hybrid"}})
+
+    def test_override_kb_search_mode(self, tmp_path):
+        cfg = self._make(tmp_path)
+
+        cfg.override_by_args(kb_search_mode="fts")
+
+        assert cfg.kb_search == KbSearchConfig(mode="fts")
+        assert cfg.kb_search_mode == "fts"
 
 
 class TestAgentConfigChannels:

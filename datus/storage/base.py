@@ -21,6 +21,7 @@ from datus.storage.datasource_scope import (
     datasource_condition,
 )
 from datus.storage.embedding_models import EmbeddingModel
+from datus.storage.fts import FtsField, FtsIndexStatus, FtsSpec
 from datus.utils.exceptions import DatusException, ErrorCode
 from datus.utils.loggings import get_logger
 
@@ -400,15 +401,39 @@ class BaseEmbeddingStore(StorageBase):
         except Exception as e:
             logger.warning(f"Failed to create vector index for {self.table_name}: {str(e)}")
 
-    def create_fts_index(self, field_names: Union[str, List[str]]):
-        """Create a full-text search index (LanceDB only)."""
+    def create_fts_index(self, fields: Union[str, List[str], FtsSpec]):
+        """Create and verify one native FTS index per configured field."""
         self._ensure_table_ready()
         if not self._supports_runtime_indexing():
             return
+        if isinstance(fields, FtsSpec):
+            spec = fields
+        elif isinstance(fields, str):
+            spec = FtsSpec((FtsField(fields),))
+        else:
+            spec = FtsSpec.from_names(fields)
+
+        remove_legacy = getattr(self.table, "remove_legacy_fts_index", None)
+        if remove_legacy is not None and remove_legacy():
+            logger.info("Removed legacy Tantivy FTS index for %s before rebuilding", self.table_name)
+
         try:
-            self.table.create_fts_index(field_names)
-        except Exception as e:
-            logger.warning(f"Failed to create fts index for {self.table_name} table: {str(e)}")
+            for field in spec.fields:
+                self.table.create_fts_index(field)
+            status_fn = getattr(self.table, "fts_index_status", None)
+            if status_fn is not None:
+                status = status_fn(spec)
+                if status != FtsIndexStatus.READY:
+                    raise RuntimeError(f"FTS index verification returned {status}")
+        except Exception as exc:
+            raise DatusException(
+                ErrorCode.STORAGE_TABLE_OPERATION_FAILED,
+                message_args={
+                    "operation": "create_fts_index",
+                    "table_name": self.table_name,
+                    "error_message": str(exc),
+                },
+            ) from exc
 
     def store_batch(self, data: List[Dict[str, Any]]):
         """
@@ -566,6 +591,7 @@ class BaseEmbeddingStore(StorageBase):
         top_n: Optional[int] = None,
         where: WhereExpr = None,
         query_type: str = "vector",
+        allow_hybrid_fallback: bool = True,
     ) -> pa.Table:
         table = self._open_existing_table_for_read()
         if table is None:
@@ -578,7 +604,9 @@ class BaseEmbeddingStore(StorageBase):
         self._ensure_table_ready()
 
         if query_type == "hybrid":
-            search_result = self._search_hybrid(query_txt, select_fields, top_n, where)
+            search_result = self._search_hybrid(
+                query_txt, select_fields, top_n, where, allow_fallback=allow_hybrid_fallback
+            )
         else:
             search_result = self._search_vector(query_txt, select_fields, top_n, where)
         if self.vector_column_name in search_result.column_names:
@@ -591,13 +619,14 @@ class BaseEmbeddingStore(StorageBase):
         select_fields: Optional[List[str]] = None,
         top_n: Optional[int] = None,
         where: WhereExpr = None,
+        allow_fallback: bool = True,
     ) -> pa.Table:
         try:
             if not top_n:
                 top_n = self.table.count_rows(where) if where else self.table.count_rows()
             results = self.table.search_hybrid(
                 query_txt,
-                self.vector_source_name,
+                self.vector_column_name,
                 top_n,
                 where=where,
                 select_fields=select_fields,
@@ -606,8 +635,18 @@ class BaseEmbeddingStore(StorageBase):
                 results = results[:top_n]
             return results
         except Exception as e:
-            logger.warning(f"Failed to search hybrid: {str(e)}, use vector search instead")
-            return self._search_vector(query_txt, select_fields, top_n, where)
+            if allow_fallback:
+                logger.warning("Hybrid search failed for %s; falling back to vector search: %s", self.table_name, e)
+                return self._search_vector(query_txt, select_fields, top_n, where)
+            raise DatusException(
+                ErrorCode.STORAGE_SEARCH_FAILED,
+                message_args={
+                    "error_message": str(e),
+                    "query": query_txt,
+                    "where_clause": str(where) if where else "(none)",
+                    "top_n": str(top_n or "all"),
+                },
+            ) from e
 
     def _search_vector(
         self,
