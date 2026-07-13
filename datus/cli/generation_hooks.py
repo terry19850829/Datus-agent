@@ -1089,7 +1089,7 @@ class GenerationHooks(AgentHooks):
             if data_source and include_semantic_objects:
                 # --- A. Table Object ---
                 table_obj = {
-                    "id": f"table:{table_name}",
+                    "id": f"table:{table_fq_name}",
                     "kind": "table",
                     "name": table_name,
                     "fq_name": table_fq_name,
@@ -1119,7 +1119,7 @@ class GenerationHooks(AgentHooks):
                     "entity": "",
                 }
                 semantic_objects.append(table_obj)
-                synced_items.append(f"table:{table_name}")
+                synced_items.append(f"table:{table_fq_name}")
 
                 # --- B. Column Objects (Measures & Dimensions & Identifiers) ---
 
@@ -1141,7 +1141,7 @@ class GenerationHooks(AgentHooks):
                         time_granularity = type_params.get("time_granularity", "")
 
                     col_obj = {
-                        "id": f"column:{table_name}.{col_name}",
+                        "id": f"column:{table_fq_name}.{col_name}",
                         "kind": "column",
                         "name": col_name,
                         "fq_name": f"{table_fq_name}.{col_name}",
@@ -1418,6 +1418,9 @@ class GenerationHooks(AgentHooks):
                             f"{', '.join(restore_failures)}"
                         ) from sync_exc
                     raise
+                # Post-commit, best-effort cleanup of shadowed stale rows; never raises.
+                if semantic_objects:
+                    semantic_rag.delete_shadowed_table_rows(semantic_objects)
                 result = {
                     "success": True,
                     "message": (
